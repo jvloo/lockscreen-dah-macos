@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened Runtime requires this to reach the camera; TCC still gates the
+	     actual grant. No other resource entitlements — this app touches nothing
+	     else privileged. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+# Build output
+/build/
+/.build/
+
+# Model conversion scratch + generated model (run scripts/fetch-model.sh)
+/.model-work/
+/Resources/FaceEmbedding.mlmodelc
+
+# Xcode / SPM
+.swiftpm/
+DerivedData/
+
+# macOS
+.DS_Store
