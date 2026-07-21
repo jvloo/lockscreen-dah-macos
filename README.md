@@ -145,6 +145,18 @@ First launch asks for camera permission. Menu bar → the red **No Face
 Enrolled** item (or **Re-Enroll My Face** afterward) to enable owner
 recognition.
 
+Prefer a prebuilt download over building from source? Grab the zip from
+[Releases](https://github.com/jvloo/lockscreen-dah-macos/releases). It's
+ad-hoc signed, not notarized (no paid Apple Developer ID behind this
+project), so macOS quarantines it on download — first launch needs one of:
+
+```sh
+xattr -cr "/Applications/Lockscreen Dah.app"   # after copying it there, or:
+```
+
+or right-click (Control-click) the app → **Open** → confirm in the dialog.
+Only needed once per download.
+
 ## Menu
 
 Status line + menu-bar icon per state:
