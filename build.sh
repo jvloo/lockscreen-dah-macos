@@ -18,6 +18,7 @@ cp ".build/release/$EXECUTABLE" "$APP/Contents/MacOS/"
 # crash logs symbolicatable.
 strip "$APP/Contents/MacOS/$EXECUTABLE"
 cp Resources/Info.plist "$APP/Contents/"
+cp Resources/Icon.png "$APP/Contents/Resources/"
 if [ -d Resources/FaceEmbedding.mlmodelc ]; then
   cp -R Resources/FaceEmbedding.mlmodelc "$APP/Contents/Resources/"
 else

@@ -34,15 +34,20 @@ final class AboutPanel: NSObject {
 
         let panel = NSPanel.floating(
             title: "About Lockscreen Dah?",
-            contentSize: NSSize(width: 420, height: 360)
+            contentSize: NSSize(width: 420, height: 380)
         )
         panel.center()
 
         let icon = NSImageView()
-        icon.image = NSImage(
-            systemSymbolName: "faceid",
-            accessibilityDescription: "Lockscreen Dah?"
-        )?.withSymbolConfiguration(.init(pointSize: 42, weight: .regular))
+        if let iconURL = Bundle.main.url(forResource: "Icon", withExtension: "png"),
+           let iconImage = NSImage(contentsOf: iconURL) {
+            // Template mode discards the source's own black, so this renders
+            // correctly in both light and dark mode via contentTintColor,
+            // same as the systemSymbolName icon it replaces.
+            iconImage.isTemplate = true
+            iconImage.size = NSSize(width: 78, height: 68)
+            icon.image = iconImage
+        }
         icon.contentTintColor = .labelColor
 
         let name = NSTextField(labelWithString: "Lockscreen Dah?")
@@ -127,6 +132,7 @@ final class AboutPanel: NSObject {
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 10
+        stack.setCustomSpacing(2, after: icon)
         stack.setCustomSpacing(2, after: name)
         stack.setCustomSpacing(16, after: version)
         stack.setCustomSpacing(16, after: purpose)

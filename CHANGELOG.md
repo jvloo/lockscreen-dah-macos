@@ -7,6 +7,19 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-07-22
+
+### Added
+
+- README overhaul: a Features summary and table of contents up top, the
+  previously separate Security model / Potential risks / Security audit /
+  Caveats sections consolidated into one Security section (Model / Risks /
+  Audit findings), and branding — a face-scan icon and an illustrative
+  `docs/demo.gif` of the menu bar → countdown → lock sequence.
+- About panel now shows the custom face-scan-and-lock icon
+  (`Resources/Icon.png`, template-rendered so it still adapts to light/dark)
+  instead of the generic system FaceID glyph.
+
 ## [1.1.0] - 2026-07-22
 
 ### Fixed
