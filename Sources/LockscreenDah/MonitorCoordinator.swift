@@ -100,6 +100,11 @@ final class MonitorCoordinator {
     // MARK: - Public controls
 
     func startMonitoring() {
+        // Stamp before the (possibly async) permission check so a denial
+        // still consumes this decision — otherwise the schedule timer would
+        // retry (and re-alert) every ~30s. beginWatching() stamps again on
+        // success; redundant but harmless.
+        lastDecisionAt = Date()
         withCameraPermission { [weak self] in self?.beginWatching() }
     }
 
@@ -211,7 +216,7 @@ final class MonitorCoordinator {
             self.pause()
             self.showAlert(
                 title: "Screen lock failed",
-                message: "Lockscreen Dah? could not lock the screen — the countdown finished but macOS rejected the lock request. Monitoring is paused; your screen is NOT being protected until this is resolved."
+                message: "Lockscreen Dah? could not lock the screen: the countdown finished but macOS rejected the lock request. Monitoring is paused; your screen is NOT being protected until this is resolved."
             )
         }
     }
@@ -451,7 +456,10 @@ final class MonitorCoordinator {
 
     /// Session unlocked, or the display woke from a locked state. The
     /// `screenIsUnlocked` notification is forgeable by any local process, so
-    /// confirm the session is genuinely unlocked before starting the camera.
+    /// confirm the session is genuinely unlocked before starting the camera —
+    /// and go through startMonitoring() (not beginWatching() directly) so a
+    /// permission revoked while locked is caught here too, instead of
+    /// silently starting a capture session that can't actually see anything.
     ///
     /// Uses the same staleness rule as resolveSchedule: if no schedule
     /// boundary has passed since our last real decision, resume whatever
@@ -464,10 +472,10 @@ final class MonitorCoordinator {
     private func resumeFromLocked() {
         guard state == .locked, !ScreenLocker.sessionIsLocked else { return }
         guard let at = lastDecisionAt, at < Settings.mostRecentBoundary(before: Date()) else {
-            beginWatching()
+            startMonitoring()
             return
         }
-        Settings.withinMonitoringHours() ? beginWatching() : pause()
+        Settings.withinMonitoringHours() ? startMonitoring() : pause()
     }
 
     // MARK: - Lock / sleep observation

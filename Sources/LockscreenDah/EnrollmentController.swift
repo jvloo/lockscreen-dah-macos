@@ -158,7 +158,7 @@ final class EnrollmentController {
     private func startStageTimeout() {
         timeout?.invalidate()
         let timer = Timer(timeInterval: 60, repeats: false) { [weak self] _ in
-            self?.showFailure("Timed out — not enough captures. Try again with better lighting.")
+            self?.showFailure("Timed out: not enough captures. Try again with better lighting.")
         }
         RunLoop.main.add(timer, forMode: .common)
         timeout = timer
@@ -266,7 +266,7 @@ final class EnrollmentController {
         let timer = Timer(timeInterval: 20, repeats: false) { [weak self] _ in
             guard let self, self.phase == .verifying else { return }
             self.showFailure(
-                "Couldn't recognize you with the new profile. Re-enroll with better lighting — this profile was not saved."
+                "Couldn't recognize you with the new profile. Re-enroll with better lighting; this profile was not saved."
             )
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -300,7 +300,7 @@ final class EnrollmentController {
         } else {
             verifyStreak = 0
             panel.setStatus(
-                String(format: "Match %.2f — below the %.2f threshold", similarity, Settings.matchThreshold),
+                String(format: "Match %.2f, below the %.2f threshold", similarity, Settings.matchThreshold),
                 isProblem: true
             )
         }

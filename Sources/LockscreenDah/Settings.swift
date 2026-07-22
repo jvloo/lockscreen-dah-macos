@@ -101,6 +101,22 @@ enum Settings {
         return boundaries.filter { $0 <= now }.max() ?? .distantPast
     }
 
+    // MARK: - Update check (About panel)
+
+    /// When the "Check for Update" action last ran, so reopening About
+    /// reflects the last result without a fresh network call.
+    static var lastUpdateCheckAt: Date? {
+        get { defaults.object(forKey: "lastUpdateCheckAt") as? Date }
+        set { defaults.set(newValue, forKey: "lastUpdateCheckAt") }
+    }
+
+    /// The version tag found at the last check, if newer than the running
+    /// app. `nil` means the last check found nothing newer (or never ran).
+    static var lastUpdateCheckNewerVersion: String? {
+        get { defaults.string(forKey: "lastUpdateCheckNewerVersion") }
+        set { defaults.set(newValue, forKey: "lastUpdateCheckNewerVersion") }
+    }
+
     /// 12-hour clock with AM/PM, matching what the time pickers display.
     static func formatMinutes(_ minutes: Int) -> String {
         let hour24 = minutes / 60

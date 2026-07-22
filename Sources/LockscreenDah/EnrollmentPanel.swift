@@ -258,7 +258,7 @@ final class EnrollmentPanel: NSObject {
 
     /// Verification passed (text only — the caller sets the buttons).
     func showVerified(score: Float) {
-        setInstruction("Verified — it's you ✓")
+        setInstruction("Verified: it's you ✓")
         statusLabel?.stringValue = String(format: "Match score %.2f against your new profile.", score)
         statusLabel?.textColor = .systemGreen
     }

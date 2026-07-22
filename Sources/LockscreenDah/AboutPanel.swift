@@ -2,8 +2,10 @@ import AppKit
 import CryptoKit
 
 /// "About Lockscreen Dah?" popup: intro, author, version, and update actions
-/// backed by the GitHub releases API — Download Update (fetch + verify the
-/// release build into Downloads) and Check Releases (open the page).
+/// backed by the GitHub releases API. The main button reads "Check for
+/// Update" until a newer release is found, then "Download Update" (fetch +
+/// verify the release build into Downloads); "Check Releases" just opens
+/// the releases page.
 final class AboutPanel: NSObject {
     static let shared = AboutPanel()
 
@@ -25,6 +27,7 @@ final class AboutPanel: NSObject {
 
     func show() {
         if let panel {
+            refreshUpdateUI()
             panel.present()
             return
         }
@@ -63,7 +66,7 @@ final class AboutPanel: NSObject {
         let purpose = NSTextField(wrappingLabelWithString: "")
         let purposeFont = NSFont.systemFont(ofSize: 13)
         let purposeText = NSMutableAttributedString(
-            string: "Built to make workplace security a habit — never leave your "
+            string: "Built to make workplace security a habit: never leave your "
                 + "screen on and unattended. ",
             attributes: [
                 .font: purposeFont,
@@ -107,7 +110,7 @@ final class AboutPanel: NSObject {
         author.allowsEditingTextAttributes = true
 
         let releases = NSButton.rounded("Check Releases", target: self, action: #selector(openReleases))
-        let download = NSButton.rounded("Download Update", target: self, action: #selector(downloadUpdate), isDefault: true)
+        let download = NSButton.rounded("Check for Update", target: self, action: #selector(checkForUpdate), isDefault: true)
         downloadButton = download
 
         let buttons = NSStackView(views: [releases, download])
@@ -142,15 +145,45 @@ final class AboutPanel: NSObject {
         panel.contentView = content
         panel.present()
         self.panel = panel
+        refreshUpdateUI()
     }
 
     // MARK: - Update: check → download → reveal
 
-    /// One click: check the latest release; if it's newer and ships a build,
-    /// download it to ~/Downloads (verifying the GitHub-provided SHA-256 when
-    /// present) and reveal it in Finder for a manual drag-to-Applications.
-    /// Deliberately manual — an ad-hoc-signed app can't safely self-replace.
-    @objc private func downloadUpdate() {
+    private struct AvailableUpdate {
+        let version: String
+        let assetURL: URL
+        let assetName: String
+        let digest: String?
+    }
+    private var availableUpdate: AvailableUpdate?
+
+    private static let checkFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd hh:mm a"
+        return formatter
+    }()
+
+    /// Reflects the last known check result (persisted in Settings, so
+    /// reopening About doesn't need a fresh network call) into the button's
+    /// label/action and the status line below it.
+    private func refreshUpdateUI() {
+        let newerAvailable = Settings.lastUpdateCheckNewerVersion.map { Self.isVersion($0, newerThan: Self.currentVersion) } ?? false
+        downloadButton?.title = newerAvailable ? "Download Update" : "Check for Update"
+        downloadButton?.action = newerAvailable ? #selector(downloadUpdate) : #selector(checkForUpdate)
+
+        guard let lastCheck = Settings.lastUpdateCheckAt else {
+            setStatus("")
+            return
+        }
+        let when = Self.checkFormatter.string(from: lastCheck)
+        setStatus(newerAvailable ? "New version available. Last check: \(when)" : "You're up to date. Last check: \(when)")
+    }
+
+    /// Step one: ask GitHub for the latest release and record the result.
+    /// Doesn't download anything — see downloadUpdate for that.
+    @objc private func checkForUpdate() {
         downloadButton?.isEnabled = false
         setStatus("Checking…")
 
@@ -163,49 +196,78 @@ final class AboutPanel: NSObject {
     }
 
     private func handleReleaseInfo(data: Data?, response: URLResponse?, error: Error?) {
-        func stop(_ message: String) {
-            setStatus(message)
-            downloadButton?.isEnabled = true
-        }
+        downloadButton?.isEnabled = true
 
-        if let error { return stop("Couldn't check: \(error.localizedDescription)") }
+        if let error {
+            setStatus("Couldn't check: \(error.localizedDescription)")
+            return
+        }
         if let http = response as? HTTPURLResponse, http.statusCode == 404 {
-            return stop("No releases published yet — you're on v\(Self.currentVersion).")
+            recordCheck(newerVersion: nil)
+            return
         }
         guard
             let data,
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let tag = json["tag_name"] as? String
         else {
-            return stop("Couldn't read the release info from GitHub.")
+            setStatus("Couldn't read the release info from GitHub.")
+            return
         }
 
         let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
         guard Self.isVersion(latest, newerThan: Self.currentVersion) else {
-            return stop("You're up to date — v\(Self.currentVersion) is the latest.")
+            recordCheck(newerVersion: nil)
+            return
         }
 
-        // Newer version exists — find a downloadable .zip build.
+        // Newer version exists — remember the downloadable .zip build, if any.
         let assets = json["assets"] as? [[String: Any]] ?? []
         guard
             let asset = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
             let urlString = asset["browser_download_url"] as? String,
             let assetURL = URL(string: urlString)
         else {
-            return stop("v\(latest) is available, but has no downloadable build — tap Check Releases.")
+            recordCheck(newerVersion: nil) // a newer tag exists, but nothing to download yet
+            setStatus("v\(latest) is available, but has no downloadable build yet. Tap Check Releases.")
+            return
         }
 
-        let name = asset["name"] as? String ?? "LockscreenDah-\(latest).zip"
-        let digest = asset["digest"] as? String // "sha256:…" when GitHub provides it
-        setStatus("Downloading v\(latest)…")
-        let task = URLSession.shared.downloadTask(with: assetURL) { [weak self] tempURL, _, error in
-            let outcome = Self.finishDownload(tempURL: tempURL, error: error, name: name, expectedDigest: digest)
+        availableUpdate = AvailableUpdate(
+            version: latest,
+            assetURL: assetURL,
+            assetName: asset["name"] as? String ?? "LockscreenDah-\(latest).zip",
+            digest: asset["digest"] as? String // "sha256:…" when GitHub provides it
+        )
+        recordCheck(newerVersion: latest)
+    }
+
+    private func recordCheck(newerVersion: String?) {
+        Settings.lastUpdateCheckAt = Date()
+        Settings.lastUpdateCheckNewerVersion = newerVersion
+        if newerVersion == nil { availableUpdate = nil }
+        refreshUpdateUI()
+    }
+
+    /// Step two, shown only once a newer version is known: fetch and verify
+    /// the release build into Downloads, then reveal it in Finder for a
+    /// manual drag-to-Applications. Deliberately manual — an ad-hoc-signed
+    /// app can't safely self-replace.
+    @objc private func downloadUpdate() {
+        guard let update = availableUpdate else {
+            checkForUpdate() // stale button state; shouldn't happen, but recover gracefully
+            return
+        }
+        downloadButton?.isEnabled = false
+        setStatus("Downloading v\(update.version)…")
+        let task = URLSession.shared.downloadTask(with: update.assetURL) { [weak self] tempURL, _, error in
+            let outcome = Self.finishDownload(tempURL: tempURL, error: error, name: update.assetName, expectedDigest: update.digest)
             DispatchQueue.main.async {
                 self?.downloadButton?.isEnabled = true
                 switch outcome {
                 case .success(let dest):
                     NSWorkspace.shared.activateFileViewerSelecting([dest])
-                    self?.setStatus("Downloaded v\(latest) to Downloads — drag it into Applications to update.")
+                    self?.setStatus("Downloaded v\(update.version) to Downloads. Drag it into Applications to update.")
                 case .failure(let message):
                     self?.setStatus(message)
                 }
@@ -226,13 +288,13 @@ final class AboutPanel: NSObject {
     ) -> DownloadOutcome {
         if let error { return .failure("Download failed: \(error.localizedDescription)") }
         guard let tempURL, let data = try? Data(contentsOf: tempURL) else {
-            return .failure("Download failed — no data received.")
+            return .failure("Download failed: no data received.")
         }
         if let expectedDigest, expectedDigest.hasPrefix("sha256:") {
             let want = expectedDigest.dropFirst("sha256:".count).lowercased()
             let got = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             guard got == want else {
-                return .failure("Checksum mismatch — download rejected. Use Check Releases instead.")
+                return .failure("Checksum mismatch: download rejected. Use Check Releases instead.")
             }
         }
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first

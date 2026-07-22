@@ -7,6 +7,23 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-22
+
+### Fixed
+
+- Camera permission is now checked on every path that starts monitoring,
+  including resume-from-lock, not just the manual toggle. Closes a corner
+  case where a permission revoked while the Mac was locked could leave
+  monitoring silently unable to see anything until the next lock cycle.
+
+### Changed
+
+- About panel's update check is now two-step: "Check for Update" records the
+  result (persisted across launches) and only switches to "Download Update"
+  once a newer release is actually found. Status line reads "You're up to
+  date" or "New version available", each with the last-check time.
+- Tightened copy across the app and README (fewer em dashes).
+
 ## [1.0.0] - 2026-07-21
 
 ### Added
@@ -46,5 +63,6 @@ and this project uses [Semantic Versioning](https://semver.org/).
 See the [Security audit](README.md#security-audit) section in the README for
 the full findings list.
 
-[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.0.0
