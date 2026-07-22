@@ -148,14 +148,19 @@ recognition.
 Prefer a prebuilt download over building from source? Grab the zip from
 [Releases](https://github.com/jvloo/lockscreen-dah-macos/releases). It's
 ad-hoc signed, not notarized (no paid Apple Developer ID behind this
-project), so macOS quarantines it on download — first launch needs one of:
+project), so macOS blocks the first launch with *"can't be opened because
+Apple cannot check it for malicious software."* To open it anyway:
 
-```sh
-xattr -cr "/Applications/Lockscreen Dah.app"   # after copying it there, or:
-```
+1. Double-click it once (expected to fail — that's the block).
+2. **System Settings → Privacy & Security** → scroll to the bottom → click
+   **Open Anyway** next to the mention of Lockscreen Dah, and authenticate.
+3. Open it again — a second, milder dialog offers **Open**; click it.
 
-or right-click (Control-click) the app → **Open** → confirm in the dialog.
-Only needed once per download.
+Only needed once per download (a rebuild changes the signature and resets
+this). `xattr -cr` alone does **not** work on current macOS — it clears the
+quarantine flag but not the separate `com.apple.provenance` attribute
+Gatekeeper also checks. Prefer Terminal instead? `sudo spctl --add
+"/Applications/Lockscreen Dah.app"` (prompts for your password).
 
 ## Menu
 
