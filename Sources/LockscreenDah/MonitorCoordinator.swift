@@ -167,6 +167,24 @@ final class MonitorCoordinator {
         monitor.start()
         startTick(interval: 1)
         state = .watching
+        verifyCameraStarted()
+    }
+
+    /// `monitor.start()` spins up the capture session asynchronously and can
+    /// fail silently (camera busy, a device-enumeration hiccup right after
+    /// sleep/wake) — confirm a few seconds later that it's actually running,
+    /// otherwise the app would sit in `.watching`, reporting "Watching for
+    /// you" with the camera never having come on: a false sense of safety,
+    /// exactly what the fail-closed design elsewhere is meant to avoid.
+    private func verifyCameraStarted() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.state == .watching, !self.monitor.isRunning else { return }
+            self.pause()
+            self.showAlert(
+                title: "Camera failed to start",
+                message: "Lockscreen Dah? could not start the camera, so your screen is NOT being watched. Monitoring has been paused. Try Start Monitoring again; if it keeps failing, check whether another app has the camera open."
+            )
+        }
     }
 
     private func beginAlert() {
@@ -238,10 +256,7 @@ final class MonitorCoordinator {
             // absence is actually suspected, not merely because the current
             // frame didn't match (head turned to a second screen is the
             // steady state, and the chain keeps absence at ~0 there).
-            presence.observe(
-                result,
-                secondsSinceInput: Self.secondsSinceLastInput()
-            )
+            presence.observe(result)
         case .alerting:
             // Only a positive owner match (or Esc) dismisses the countdown —
             // an unmatched face alone can't keep the screen open.

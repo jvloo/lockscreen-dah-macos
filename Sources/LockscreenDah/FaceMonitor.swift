@@ -11,8 +11,8 @@ struct DetectionResult {
     var bodyCount: Int
     /// A face positively matched the enrolled owner (any face when unenrolled).
     var ownerMatched: Bool
-    /// A near-frontal face was seen that strongly mismatches the owner —
-    /// a clear stranger, not just a turned/ambiguous head.
+    /// A near-frontal face was seen that didn't match the owner (similarity
+    /// below `matchThreshold`) — not just a turned/ambiguous head.
     var strangerSeen: Bool
     /// Sample from the largest near-frontal face — only populated in enrollment mode.
     var enrollmentSample: EnrollmentSample?
@@ -31,7 +31,6 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private let output = AVCaptureVideoDataOutput()
     private let queue = DispatchQueue(label: "com.xavierloo.lockscreen-dah.camera", qos: .utility)
     private var configured = false
-    private var configurationFailed = false
     private var lastAnalysis = Date.distantPast
 
     // Reused across frames (only touched on `queue`) — Vision request objects
@@ -59,8 +58,6 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// Only faces this frontal (~30°) are eligible to be declared a stranger —
     /// profile embeddings are too unreliable to accuse anyone.
     private let maxStrangerYaw: Float = 0.5
-    /// Below this similarity a frontal face is a clear stranger.
-    private let strangerSimilarity: Float = 0.15
     /// At most this many faces get the (pricier) embedding pass per frame.
     private let maxFacesToMatch = 4
 
@@ -93,16 +90,24 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         }
     }
 
+    /// Whether the capture session is actually delivering frames right now —
+    /// distinct from the coordinator's `.watching` state, which is set
+    /// optimistically the moment `start()` is called and has no idea whether
+    /// the session underneath it ever came up.
+    var isRunning: Bool { queue.sync { session.isRunning } }
+
+    /// Retries device configuration on every call rather than giving up
+    /// permanently after one failure: a transient hiccup (camera briefly
+    /// busy, device still enumerating right after waking from sleep) used to
+    /// disable monitoring's ability to ever see anything again for the rest
+    /// of the app's life, silently, since nothing else ever re-attempted it.
     private func configureIfNeeded() {
-        guard !configured, !configurationFailed else { return }
+        guard !configured else { return }
         guard
             let device = AVCaptureDevice.default(for: .video),
             let input = try? AVCaptureDeviceInput(device: device),
             session.canAddInput(input)
-        else {
-            configurationFailed = true
-            return
-        }
+        else { return }
 
         session.beginConfiguration()
         if session.canSetSessionPreset(.vga640x480) {
@@ -201,8 +206,13 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                         result.ownerMatched = true
                         break
                     }
-                    if similarity < strangerSimilarity,
-                       let yaw = face.yaw, abs(yaw.floatValue) <= maxStrangerYaw {
+                    // similarity < matchThreshold here (the branch above didn't
+                    // fire) — no separate, laxer "clear stranger" bar below that:
+                    // a gap between the two thresholds left anyone who scored
+                    // between them neither matched nor flagged, and the presence
+                    // chain's seat-continuity fallback (any face keeps it alive)
+                    // then held the screen open for them indefinitely.
+                    if let yaw = face.yaw, abs(yaw.floatValue) <= maxStrangerYaw {
                         result.strangerSeen = true
                     }
                 }

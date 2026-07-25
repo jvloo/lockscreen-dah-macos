@@ -1,16 +1,17 @@
-<div align="center">
-  <picture>
-    <img src="docs/icon-white.png" width="96" alt="Lockscreen Dah? icon">
-  </picture>
-</div>
-
-<h1 align="center">Lockscreen Dah?</h1>
+<h1 align="center">
+  <img src="docs/icon-white.png" width="96" alt="Lockscreen Dah? icon"><br>
+  Lockscreen Dah? (macOS)
+</h1>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Swift-5.10-orange" alt="Swift">
   <a href="https://github.com/jvloo/lockscreen-dah-macos/releases"><img src="https://img.shields.io/github/v/release/jvloo/lockscreen-dah-macos" alt="Release"></a>
+</p>
+
+<p align="center">
+  Using Windows? <a href="https://github.com/jvloo/lockscreen-dah-windows">Check out here</a>
 </p>
 
 macOS menu-bar app that watches the webcam for **your** face and auto-locks the
@@ -29,9 +30,10 @@ corner. Face the screen again to cancel, or let it expire to lock the Mac.
 
 - **On-device face recognition**: Vision + Core ML (InsightFace MobileFaceNet,
   landmark-aligned); nothing camera-derived ever leaves the machine.
-- **Seat-continuity presence**: a face at any angle, an upper body in frame,
-  or live keyboard/mouse input all keep your session open. Only losing all
-  three for the grace period triggers a countdown.
+- **Seat-continuity presence**: a face at any angle or an upper body in frame
+  keeps your session open. Losing both for the grace period triggers a
+  countdown — and a face already confirmed as not you never counts toward
+  it, so simply sitting in your seat buys a stranger no extra time.
 - **Camera rests while you type**, waking (and re-verifying identity) on the
   next pause, for near-zero CPU during typing-heavy stretches.
 - **Discreet blackout countdown**: reads as a sleeping display, not a
@@ -193,8 +195,12 @@ schedule is a convenience, not a security feature.
 
 ### Open at Login (default on)
 
-Registers via `SMAppService` on first run; the checkmark reflects the actual
-system registration state, not a stored preference.
+Registers via `SMAppService`; the checkmark reflects the actual system
+registration state, not a stored preference. Your choice is also saved
+separately and reconciled against the real registration on every launch (not
+just the first), clearing out any stale entry before re-registering — a
+rebuild re-signs the app, and macOS's login-item registration doesn't
+reliably survive that on its own.
 
 ### Hidden: match threshold (default 0.35)
 
@@ -219,7 +225,7 @@ AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
     clamped 0.4–2.5 s; ~2.5 Hz only while confirming absence / countdown)
   → Vision face detection (any head angle); upper-body detection only on face-less frames
   → [face found] align → Core ML MobileFaceNet embedding (ANE) → cosine match vs enrolled profile
-  → presence chain (face | body | input) + state machine → blackout countdown overlay → SACLockScreenImmediate
+  → presence chain (face | body) + state machine → blackout countdown overlay → SACLockScreenImmediate
 ```
 
 - **Owner recognition**: a bundled MobileFaceNet model (InsightFace `w600k_mbf`,
@@ -235,11 +241,17 @@ AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
   requires Touch ID or your macOS password, so a passerby can't swap it.
   Profile lives at `~/Library/Application Support/LockscreenDah/profile.json`.
 - **Presence chain**: identity is *established* by a frontal match, then
-  *maintained* with no time cap by seat continuity: a face at any angle, an
-  upper body in frame, or live keyboard/mouse input. Work turned toward a
-  second screen for an hour; the countdown never appears while you're in the
-  seat or typing. A clearly frontal face that strongly mismatches you for 3
-  consecutive frames breaks the chain even if they keep the seat warm.
+  *maintained* with no time cap by seat continuity: a face at any angle, or
+  an upper body in frame. Work turned toward a second screen for an hour;
+  the countdown never appears while you're in the seat. A face already
+  confirmed as not you never counts toward that continuity, so someone
+  taking over your seat can't use their own face to buy extra time; 3
+  consecutive frontal mismatches also breaks the chain outright.
+- **Multiple faces in frame are all checked** (largest first, up to 4), and a
+  match on any of them keeps the session open — so showing a colleague
+  something at your screen, with your own face still visible, never
+  triggers a countdown even if theirs gets flagged a mismatch the same
+  frame.
 - **The countdown is the identity gate**: once presence lapses past the
   grace period, only a fresh positive match (or Esc) cancels it; an
   unmatched face alone can't keep the screen open. The overlay is
@@ -248,13 +260,19 @@ AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
 - **Camera idle while typing**: sustained keyboard/mouse use puts the
   capture session to sleep entirely (LED off, ~0% CPU); it wakes once
   typing pauses. Waking is an identity gate: the camera was blind, so the
-  chain must be re-established by a fresh match before input/body can
-  maintain it again. Never idles before a positive match, during
+  chain must be re-established by a fresh match before face or body alone
+  can maintain it again. Never idles before a positive match, during
   countdown/enrollment, or when the grace period is under 3 s.
 - **Lock is verified, not assumed**: a few seconds after firing the lock,
   the app confirms the session actually locked. A silent failure (e.g. the
   private API disappearing in an OS update) pauses monitoring and alerts
   you, instead of sitting in a fake "locked" state.
+- **Camera start is verified too**: a few seconds after starting to watch,
+  the app confirms the capture session is actually running (device
+  configuration retries every attempt rather than giving up permanently
+  after one transient failure). If it never came up, monitoring falls back
+  to Paused with an alert, rather than reporting "Watching for you" while
+  actually blind.
 - **Unenrolled fallback**: without a profile (or model) it degrades to
   presence-only: any face counts.
 - **Low footprint**: sensor frame rate capped, analysis throttled, the
@@ -277,7 +295,7 @@ What the app is and isn't, so the guarantees are clear:
   what lets you work turned toward a second screen without nagging.
 - **Two identity gates re-assert "is it really you"**: the countdown (a
   stranger's face alone can't hold the screen open) and waking from camera
-  idle (input/body alone won't restore presence; only a fresh match will).
+  idle (body alone won't restore presence; only a fresh match will).
 - **Fail-closed.** Camera contention, a stuck pipeline, or a lost face all
   let absence grow into a lock rather than a false sense of safety.
 - **All processing is on-device**. See [Audit findings](#audit-findings)
@@ -291,10 +309,10 @@ countdown 3 s, wake 2 s):
 | Scenario | Max exposure |
 |---|---|
 | You leave; empty seat | ~6 s (grace + countdown) |
-| Stranger takes the seat and faces the screen | ~9 s (3-frame challenge + grace + countdown) |
+| Stranger takes the seat and faces the screen | ~6 s, same as an empty seat — a face already confirmed as not you doesn't buy it any extra time |
 | Stranger takes over during camera idle, then pauses typing ≥ wake threshold | ~8 s after the pause (wake gate: only a match restores presence) |
 | Stranger takes over during camera idle and **never pauses input** past the wake threshold | **Unbounded** (the camera never wakes). Mitigate: lower Wake From Idle After, or Never Idle. |
-| Stranger in the seat who **never faces the screen** (head down, turned away) while the camera watches | **Unbounded**: seat continuity counts any face/body, and the stranger challenge only accuses frontal faces. In practice people glance at screens constantly; the challenge fires at their first 3 frontal frames. |
+| Stranger in the seat who **never faces the screen** (head down, turned away) while the camera watches | **Unbounded**: the body-detection fallback has no identity check at all (only the face path does), so a torso in frame alone still maintains presence indefinitely. In practice people glance at screens constantly, which immediately re-triggers the (now-instant) face mismatch. |
 
 Structural risks, independent of settings:
 
@@ -315,9 +333,12 @@ Structural risks, independent of settings:
   same private API as Ctrl-Cmd-Q) could disappear in a macOS update;
   `CGSession -suspend` is the fallback, and either way the post-lock
   verification above catches a silent failure rather than hiding it.
-- **Camera contention**: another app owning the camera can stall detection;
-  absence then grows until the countdown fires and locks (fail-closed, but
-  expect a surprise blackout).
+- **Camera contention**: another app owning the camera can stall detection
+  in an *already-running* session; absence then grows until the countdown
+  fires and locks (fail-closed, but expect a surprise blackout). Contention
+  that prevents the session from starting in the first place is a separate,
+  now-handled case — see [How it works](#how-it-works)'s "Camera start is
+  verified too".
 - Physical access to your unlocked Mac is, as always, game over for any
   software measure.
 

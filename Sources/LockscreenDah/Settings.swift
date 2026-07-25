@@ -101,6 +101,19 @@ enum Settings {
         return boundaries.filter { $0 <= now }.max() ?? .distantPast
     }
 
+    // MARK: - Login item
+
+    /// The user's chosen intent for "Open at Login" — tracked separately
+    /// from `SMAppService.mainApp.status`, which reflects only the currently
+    /// installed build: reinstalling the app re-signs it, and the OS-level
+    /// registration doesn't reliably carry over. This is what lets the app
+    /// reconcile the real registration against the user's actual preference
+    /// on every launch instead of just the first one.
+    static var openAtLoginEnabled: Bool {
+        get { value(forKey: "openAtLoginEnabled", default: true) }
+        set { defaults.set(newValue, forKey: "openAtLoginEnabled") }
+    }
+
     // MARK: - Update check (About panel)
 
     /// When the "Check for Update" action last ran, so reopening About

@@ -22,7 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         coordinator.onStateChange = { [weak self] in self?.refreshStatusIcon() }
 
-        registerLoginItemOnFirstRun()
+        syncLoginItemRegistration()
         coordinator.startPerSchedule()
     }
 
@@ -250,12 +250,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func toggleLaunchAtLogin() {
+        let enabling = SMAppService.mainApp.status != .enabled
         do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
+            if enabling {
+                // Clear out any stale entry left by a previous build's
+                // signature first — reinstalling can otherwise leave an
+                // orphaned duplicate alongside this new registration.
+                try? SMAppService.mainApp.unregister()
                 try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
             }
+            Settings.openAtLoginEnabled = enabling
         } catch {
             let alert = NSAlert()
             alert.messageText = "Could not update login item"
@@ -270,13 +276,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Login item
 
-    private func registerLoginItemOnFirstRun() {
-        let key = "didRegisterLoginItem"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
-        // Only meaningful when running from a stable location (build.sh installs
-        // to /Applications). Failure is fine — the menu toggle remains.
-        try? SMAppService.mainApp.register()
-        UserDefaults.standard.set(true, forKey: key)
+    /// Reconciles the OS-level login-item registration against the user's
+    /// stored intent on every launch, not just the first ever. Necessary
+    /// because rebuilding/reinstalling the app produces a new ad-hoc
+    /// signature each time, and macOS's registration doesn't reliably carry
+    /// over: without this, an update could silently leave "Open at Login"
+    /// unregistered for the new build even though the user turned it on
+    /// before, and the next manual toggle would add a second entry
+    /// alongside the orphaned one from the previous build rather than
+    /// replacing it.
+    private func syncLoginItemRegistration() {
+        let shouldBeEnabled = Settings.openAtLoginEnabled
+        let isEnabled = SMAppService.mainApp.status == .enabled
+        guard shouldBeEnabled != isEnabled else { return }
+        if shouldBeEnabled {
+            try? SMAppService.mainApp.unregister()
+            try? SMAppService.mainApp.register()
+        } else {
+            try? SMAppService.mainApp.unregister()
+        }
     }
 }
 
