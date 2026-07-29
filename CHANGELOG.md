@@ -7,6 +7,111 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-29
+
+A timing-accuracy release. Both deadlines the app promises (when the countdown
+appears, when the screen locks) were decided by polling timers and drifted late,
+and reviewing that turned up several ways the countdown could fire when it
+shouldn't. That review also showed some of the offered duration settings could
+not do what their labels implied, so the four duration menus were reworked and a
+new Instant option added. Timings below were measured, not estimated.
+
+### Fixed
+
+- The countdown now appears at the configured "Start Countdown After" instead
+  of up to 1.02 s late (0.51 s on average). It was decided by a 1 Hz poll whose
+  phase was anchored to when monitoring started rather than to when presence
+  was lost. Both deadlines are now precise one-shot timers, measured accurate
+  to 3-5 ms.
+- The screen now locks at the configured "Countdown Duration" instead of up to
+  0.27 s late, same cause (a 0.25 s poll). That tick now only redraws the
+  overlay.
+- The countdown duration is measured from when the overlay is actually on
+  screen. It used to start before the overlay windows were built and the app
+  activated, and the fade-in took another 0.5 s on top, so the warning you
+  could actually read was about half a second shorter than configured. At the
+  1 s setting that was half of it. The fade is now 0.2 s.
+- Presence is timestamped at frame capture rather than after analysis. Vision
+  plus up to four Core ML embeddings plus a hop to the main thread is
+  100-400 ms, and all of it used to count against you as absence.
+- The grace period no longer counts time when the camera was not yet looking.
+  It was anchored to the moment monitoring started, but opening a capture
+  session takes about a second to produce a first frame, which a short grace
+  period expires entirely inside. At the 1 s setting that meant a full-screen
+  blackout roughly 1.4 s after every unlock, with the owner sitting right
+  there. It now counts from the later of "presence last confirmed" and "this
+  session's first delivered frame".
+- A countdown can no longer begin while the camera is resting ("Idle while
+  typing"). Lowering "Start Countdown After" during a rest pulled the deadline
+  in ahead of the tick that would have woken the camera, so the countdown ran
+  with the capture session stopped: no face could cancel it and the lock was
+  unavoidable short of Esc. Camera rest now ends and the session restarts
+  instead.
+- "Camera failed to start" could fire against a perfectly good camera and leave
+  monitoring paused. The check was an uncancelled delayed block, so Start,
+  Pause, Start within its window left the stale check judging the new session.
+  It is now bound to the session it was scheduled for.
+- Camera health is judged by whether the session has actually delivered a
+  frame, not by whether it claims to be running, and that is reset when the
+  session stops. A stopped or wedged camera can no longer read as healthy.
+- Denying camera access during enrollment left the capture session running
+  behind a menu reading "Paused", with no way back. It now tears down properly.
+- The Esc failsafe no longer counts an Esc that cancelled nothing, and clears
+  its strikes after a re-enrollment, so it can't pause monitoring to repeat
+  advice you just followed.
+- "Start Countdown After" and "Countdown Duration" are clamped when read. Now
+  that both are precise one-shot timers, a stray or tampered value of zero or
+  less would schedule a fire date in the past and spin the run loop.
+
+### Changed
+
+- Reworked the four duration settings so every option does what its label says
+  and none silently disables another:
+
+  | Setting | Was | Now |
+  |---|---|---|
+  | Start Countdown After | 1/3/5/10/15/30 s | **1/3/5/10 s** |
+  | Countdown Duration | 1/3/5/10/15/30 s | **3/5/10 s or Instant** |
+  | Idle When Typing For | 5/10/15/30 s / Never | **10/20/30 s / Never** |
+  | Wake From Idle After | 1/2/3/5/10 s | **1/2/3/5 s** |
+
+  Countdown 1 s is gone because cancelling one takes about a second in practice,
+  so it was a lock with no real appeal rather than a warning; the two duration
+  pickers no longer share a single list, since detection delay and countdown
+  length have different floors. 15 and 30 s detection delays are gone because
+  sampling caps at 2.5 s above 10 s, making them identical in cost and differing
+  only in how long you stay exposed. Idle 5 s is gone because the 20 s minimum
+  awake time made it behave the same as 10 s. Wake 10 s is gone because it left
+  a stranger invisible for up to ten seconds of continuous typing.
+- New **Instant** countdown option: locks the moment presence lapses, with no
+  overlay. Note it has no escape hatch — no overlay means no Esc, so the
+  Esc-rescue failsafe can't intervene if recognition starts misjudging you.
+- Detection sampling is meaningfully more accurate at short delays. The
+  "confirming absence" cadence was 0.4 s, which rounded up to two frame periods
+  against the 3 fps sensor cap and silently discarded every other frame already
+  paid for; it is now below one frame period, so every frame is analyzed. The
+  idle cadence scales as `delay/4` rather than `delay/3`. At the 1 s setting the
+  countdown's worst-case earliness halves (1.0 s → 0.33 s) and roughly twice as
+  many detection attempts fit inside the window, so a single bad frame no longer
+  causes a blackout.
+- Camera idling is unavailable below a 3 s countdown delay (unchanged), but the
+  menu now greys those two rows out and shows the reason instead of accepting
+  the setting and ignoring it.
+- Camera-rest wake-up is a single shared path, and the restarted session gets
+  the same startup verification as any other.
+
+### Known limits
+
+- Presence is sampled, not continuous, so measured from the instant you
+  actually stand up the countdown appears up to one sampling interval before
+  the configured time (1.0 s at the 3 s setting, 0.33 s at 1 s). It errs early,
+  never late. See the README's "Start Countdown After" for the full table.
+- A stored value that is no longer offered (say a 30 s delay, or a 1 s
+  countdown) stays in effect until you pick a new one from the menu — settings
+  are not rewritten behind your back.
+- Both deadlines are wall-clock, so a forward system clock step fires them
+  early. Sleep and wake are handled in the safe direction.
+
 ## [1.1.2] - 2026-07-25
 
 ### Fixed
@@ -126,7 +231,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 See the [Security audit](README.md#security-audit) section in the README for
 the full findings list.
 
-[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.2.0
 [1.1.2]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.2
 [1.1.1]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.1
 [1.1.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.0

@@ -12,7 +12,10 @@ import Foundation
 struct PresenceTracker {
     private(set) var chainActive = false
     private var strangerStreak = 0
-    private var lastOwnerSeen: Date
+    /// Wall-clock instant presence was last confirmed — the anchor a grace
+    /// deadline is computed from. Exposed so the coordinator can schedule a
+    /// precise one-shot timer against it instead of polling.
+    private(set) var lastOwnerSeen: Date
 
     /// Consecutive clear-stranger frames that end the chain.
     private let strangerStreakLimit: Int
@@ -74,10 +77,5 @@ struct PresenceTracker {
             lastOwnerSeen = now
         }
         return false
-    }
-
-    /// Seconds since presence was last confirmed.
-    func absence(now: Date = Date()) -> TimeInterval {
-        now.timeIntervalSince(lastOwnerSeen)
     }
 }

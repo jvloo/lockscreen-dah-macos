@@ -8,17 +8,34 @@ enum Settings {
         defaults.object(forKey: key) as? T ?? fallback
     }
 
+    /// Both deadlines below are armed as precise one-shot timers, so a stray or
+    /// tampered defaults value of 0 (or negative) would schedule a fire date in
+    /// the past and spin the run loop, rebuilding the overlay every pass. The
+    /// old polling implementation floored these implicitly; clamping restores
+    /// that guarantee explicitly. Same reasoning as `matchThreshold` below.
+    private static let durationBounds = (min: 0.5, max: 600.0)
+
     /// How long the owner's face must be absent before the countdown overlay appears.
     static var gracePeriod: TimeInterval {
-        get { value(forKey: "gracePeriod", default: 3) }
+        get { min(max(value(forKey: "gracePeriod", default: 3), durationBounds.min), durationBounds.max) }
         set { defaults.set(newValue, forKey: "gracePeriod") }
     }
 
-    /// Length of the on-screen countdown before the screen locks.
+    /// Length of the on-screen countdown before the screen locks. Exactly 0 is
+    /// meaningful — "Instant", lock with no countdown at all — so it survives
+    /// the clamp; anything else below the floor (including a negative, which
+    /// must not silently become the most aggressive setting) is clamped up.
     static var countdownDuration: TimeInterval {
-        get { value(forKey: "countdownDuration", default: 3) }
+        get {
+            let stored: TimeInterval = value(forKey: "countdownDuration", default: 3)
+            if stored == 0 { return 0 }
+            return min(max(stored, durationBounds.min), durationBounds.max)
+        }
         set { defaults.set(newValue, forKey: "countdownDuration") }
     }
+
+    /// True when the countdown is disabled entirely (lock on presence lapse).
+    static var locksInstantly: Bool { countdownDuration == 0 }
 
     /// Sustained typing/mouse use required before the camera goes idle.
     /// 0 = never idle (the camera always watches).
@@ -140,10 +157,26 @@ enum Settings {
         return String(format: "%d:%02d %@", hour12, minute, period)
     }
 
-    /// Both duration pickers offer the same steps — one source so they can't drift.
-    static let gracePeriodOptions: [TimeInterval] = [1, 3, 5, 10, 15, 30]
-    static let countdownOptions: [TimeInterval] = gracePeriodOptions
+    /// The two duration pickers deliberately do NOT share a list. They look
+    /// like the same quantity but aren't: detection delay is a preference
+    /// (aggressive is legitimate), whereas a countdown too short to be
+    /// cancelled is simply a broken control — the cancel path needs ~1 s
+    /// (overlay fade, you noticing, the next analyzed frame, the embedding),
+    /// so the countdown floor is 3 s while detection goes down to 1 s.
+    static let gracePeriodOptions: [TimeInterval] = [1, 3, 5, 10]
+    /// 0 renders as "Instant": lock the moment presence lapses, no overlay.
+    static let countdownOptions: [TimeInterval] = [3, 5, 10, 0]
     /// 0 renders as "Never Idle".
-    static let cameraRestOptions: [TimeInterval] = [5, 10, 15, 30, 0]
-    static let cameraWakeOptions: [TimeInterval] = [1, 2, 3, 5, 10]
+    static let cameraRestOptions: [TimeInterval] = [10, 20, 30, 0]
+    static let cameraWakeOptions: [TimeInterval] = [1, 2, 3, 5]
+
+    /// Camera rest is unavailable below this countdown delay: waking the
+    /// camera and landing one fresh match needs about a second, which a 1 s
+    /// delay can't absorb — the overlay would flash at a seated user after
+    /// every typing pause. The menu disables the idle rows below it and says
+    /// so, rather than accepting the setting and silently ignoring it.
+    static let cameraRestMinimumGrace: TimeInterval = 3
+
+    /// Whether camera rest can operate at the current countdown delay.
+    static var cameraRestAvailable: Bool { gracePeriod >= cameraRestMinimumGrace }
 }

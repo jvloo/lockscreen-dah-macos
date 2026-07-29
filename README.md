@@ -133,30 +133,57 @@ Items:
 
 Every setting, what it trades off, and which way to turn it.
 
-### Start Countdown After (1/3/5/10/15/30 s, default 3)
+### Start Countdown After (1/3/5/10 s, default 3)
 
 How long presence can lapse before the blackout countdown appears.
 
 - **Lower** = faster reaction when you leave, but more false blackouts
   (glancing at your phone under the desk), and **higher CPU**: the analysis
-  cadence is `grace/3` (clamped 0.4–2.5 s), so grace 1 samples at the maximum
-  0.4 s rate permanently. At 1 s, camera idling is also disabled (wake +
-  spin-up + match can't fit inside the grace).
-- **Higher** = cheaper (grace 30 analyzes every 2.5 s) and calmer, but a
-  stranger inherits a bigger head start: the countdown starts up to `grace`
-  seconds after you're gone.
+  cadence is `delay/4`, floored at 0.25 s and capped at 2.5 s, so 1 s analyzes
+  every frame the sensor produces. At 1 s, camera idling is also unavailable
+  (waking and landing one fresh match doesn't fit inside a 1 s delay) — the
+  menu greys those rows out and says so rather than ignoring them silently.
+- **Higher** = cheaper (10 s analyzes every ~2.7 s) and calmer, but a stranger
+  inherits a bigger head start.
 
-### Countdown Duration (1/3/5/10/15/30 s, default 3)
+**How exact is it?** The countdown fires within a few milliseconds of the
+configured delay after presence was last *confirmed*. But presence is sampled,
+not watched continuously, so the last confirmation is up to one sampling
+interval before you actually stood up, and measured from *that* moment the
+countdown lands **early** by up to that interval:
+
+| Setting | Effective sampling | Countdown appears after you actually leave |
+|---|---|---|
+| 1 s | 0.33 s | 0.67–1.0 s |
+| 3 s | 1.0 s | 2.0–3.0 s |
+| 5 s | 1.33 s | 3.67–5.0 s |
+| 10 s | 2.67 s | 7.3–10.0 s |
+
+It never lands late. Closing the gap further means sampling faster, which is
+the CPU tradeoff above. The clock also doesn't start until the camera has
+delivered its first frame, so opening a session never eats into your delay.
+
+### Countdown Duration (3/5/10 s or Instant, default 3)
 
 Length of the blackout countdown before the lock fires.
 
 - **Lower** = the screen locks sooner after a confirmed absence; also less
-  time for *you* to cancel a false alarm with a glance.
-- **Higher** = more forgiving of false alarms, but extends the total
-  exposure window (grace + countdown) before a real lock. A stranger can't
-  cancel it either way: only your face or Esc can.
+  time for *you* to cancel a false alarm with a glance. 3 s is the floor
+  because cancelling takes about a second in practice (overlay fade, you
+  noticing, the next analyzed frame, the embedding) — a shorter countdown
+  would be a lock with no real appeal, not a warning.
+- **Higher** = more forgiving of false alarms, but extends the total exposure
+  window (delay + countdown) before a real lock. A stranger can't cancel it
+  either way: only your face or Esc can.
+- **Instant** = no countdown and no overlay at all; the screen locks the moment
+  presence lapses. Strictest setting, and the only one with **no escape hatch**:
+  because there's no overlay there's no Esc, so the "3 Esc-rescues in 10 minutes
+  auto-pauses monitoring" failsafe can't intervene. If recognition starts
+  misjudging you (bad enrollment, bad lighting), it will keep locking you out
+  with no in-app way to stop it short of quitting from the menu bar. Pair it
+  with a verified enrollment.
 
-### Idle When Typing For (5/10/15/30 s / Never Idle, default 10)
+### Idle When Typing For (10/20/30 s / Never Idle, default 10)
 
 Sustained keyboard/mouse use required before the camera goes to sleep
 (input alone proves presence once your identity is established).
@@ -168,7 +195,10 @@ Sustained keyboard/mouse use required before the camera goes to sleep
   wake option below is disabled. Maximum vigilance: no blind window at all;
   choose this in hostile environments.
 
-### Wake From Idle After (1/2/3/5/10 s, default 2)
+Unavailable when Start Countdown After is 1 s, in which case both this and the
+wake option below are greyed out with the reason shown.
+
+### Wake From Idle After (1/2/3/5 s, default 2)
 
 The typing pause that wakes an idle camera.
 
@@ -221,8 +251,8 @@ at read time to **[0.2, 0.9]** so a stray value can't turn matching into
 
 ```
 AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
-  → adaptive throttle (idle scales with grace period: one analysis per grace/3 s,
-    clamped 0.4–2.5 s; ~2.5 Hz only while confirming absence / countdown)
+  → adaptive throttle (idle scales with the countdown delay: one analysis per
+    delay/4 s, clamped 0.25–2.5 s; every frame while confirming absence / counting down)
   → Vision face detection (any head angle); upper-body detection only on face-less frames
   → [face found] align → Core ML MobileFaceNet embedding (ANE) → cosine match vs enrolled profile
   → presence chain (face | body) + state machine → blackout countdown overlay → SACLockScreenImmediate
@@ -267,12 +297,13 @@ AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
   the app confirms the session actually locked. A silent failure (e.g. the
   private API disappearing in an OS update) pauses monitoring and alerts
   you, instead of sitting in a fake "locked" state.
-- **Camera start is verified too**: a few seconds after starting to watch,
-  the app confirms the capture session is actually running (device
-  configuration retries every attempt rather than giving up permanently
-  after one transient failure). If it never came up, monitoring falls back
-  to Paused with an alert, rather than reporting "Watching for you" while
-  actually blind.
+- **Camera start is verified too**: a few seconds after starting to watch, the
+  app confirms the session has actually *delivered a frame* (not merely that it
+  claims to be running, which a wedged session can). If nothing arrived,
+  monitoring falls back to Paused with an alert rather than reporting "Watching
+  for you" while blind. A countdown is never started off a camera that has
+  produced no frames, since absence it never observed is not evidence.
+  Configuration is retried on each start attempt until it first succeeds.
 - **Unenrolled fallback**: without a profile (or model) it degrades to
   presence-only: any face counts.
 - **Low footprint**: sensor frame rate capped, analysis throttled, the

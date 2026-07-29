@@ -132,38 +132,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // them disabled and AppKit would render their views dimmed.
         settingsMenu.autoenablesItems = false
 
-        settingsMenu.addItem(durationSubmenu(
-            title: "Start Countdown After",
-            options: Settings.gracePeriodOptions,
-            get: { Settings.gracePeriod },
-            set: { Settings.gracePeriod = $0 }
-        ))
-        settingsMenu.addItem(durationSubmenu(
-            title: "Countdown Duration",
-            options: Settings.countdownOptions,
-            get: { Settings.countdownDuration },
-            set: { Settings.countdownDuration = $0 }
-        ))
-        // Built before the idle item so its enabled state can track "Never
-        // Idle" live (waking from idle is meaningless when idling is off).
+        // The idle pair is built first so the countdown-delay rows below can
+        // refresh their availability live: camera rest can't operate under a
+        // short delay, and these rows say so rather than silently ignoring it.
+        let idleTitle = "Idle When Typing For"
+        let idleValueLabel: (TimeInterval) -> String = { $0 == 0 ? "Never" : "\(Int($0))s" }
         let wakeItem = durationSubmenu(
             title: "Wake From Idle After",
             options: Settings.cameraWakeOptions,
             get: { Settings.cameraWakeQuiet },
             set: { Settings.cameraWakeQuiet = $0 }
         )
-        wakeItem.isEnabled = Settings.cameraRestAfter > 0
-        settingsMenu.addItem(durationSubmenu(
-            title: "Idle When Typing For",
+        let idleItem = durationSubmenu(
+            title: idleTitle,
             options: Settings.cameraRestOptions,
             get: { Settings.cameraRestAfter },
             set: { [weak wakeItem] in
                 Settings.cameraRestAfter = $0
-                wakeItem?.isEnabled = $0 > 0
+                wakeItem?.isEnabled = $0 > 0 && Settings.cameraRestAvailable
             },
-            rowLabel: { $0 == 0 ? "Never Idle" : ($0 == 1 ? "1 second" : "\(Int($0)) seconds") },
-            valueLabel: { $0 == 0 ? "Never" : "\(Int($0))s" }
+            rowLabel: { $0 == 0 ? "Never Idle" : "\(Int($0)) seconds" },
+            valueLabel: idleValueLabel
+        )
+        let refreshIdleAvailability = { [weak idleItem, weak wakeItem] in
+            let available = Settings.cameraRestAvailable
+            idleItem?.isEnabled = available
+            idleItem?.title = available
+                ? "\(idleTitle) \(idleValueLabel(Settings.cameraRestAfter))"
+                : "\(idleTitle) (needs \(Int(Settings.cameraRestMinimumGrace))s+)"
+            wakeItem?.isEnabled = available && Settings.cameraRestAfter > 0
+        }
+        refreshIdleAvailability()
+
+        settingsMenu.addItem(durationSubmenu(
+            title: "Start Countdown After",
+            options: Settings.gracePeriodOptions,
+            get: { Settings.gracePeriod },
+            set: { [weak self] in
+                Settings.gracePeriod = $0
+                // The scheduled countdown deadline (if already watching) was
+                // computed from the old grace period — recompute it now
+                // rather than waiting for the next real presence observation.
+                self?.coordinator.gracePeriodSettingChanged()
+                // This setting gates camera rest, so the rows below it can
+                // change availability from under the open menu.
+                refreshIdleAvailability()
+            }
         ))
+        settingsMenu.addItem(durationSubmenu(
+            title: "Countdown Duration",
+            options: Settings.countdownOptions,
+            get: { Settings.countdownDuration },
+            set: { Settings.countdownDuration = $0 },
+            rowLabel: { $0 == 0 ? "Instant (no countdown)" : "\(Int($0)) seconds" },
+            valueLabel: { $0 == 0 ? "Instant" : "\(Int($0))s" }
+        ))
+        settingsMenu.addItem(idleItem)
         settingsMenu.addItem(wakeItem)
         let hoursTitle = Settings.scheduleEnabled
             ? "Active Hours (\(Settings.formatMinutes(Settings.scheduleStartMinutes))–\(Settings.formatMinutes(Settings.scheduleEndMinutes)))…"

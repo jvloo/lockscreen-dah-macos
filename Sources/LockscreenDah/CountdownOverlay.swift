@@ -59,7 +59,10 @@ final class CountdownOverlay: NSObject {
 
         update(remaining: remaining)
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.5
+            // Short enough that the countdown is legible almost immediately:
+            // the fade is subtracted from the warning the user actually gets,
+            // and at a 1 s countdown a half-second fade ate half of it.
+            context.duration = 0.2
             for window in windows {
                 window.animator().alphaValue = 1
             }

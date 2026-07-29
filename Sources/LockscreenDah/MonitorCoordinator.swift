@@ -34,8 +34,27 @@ final class MonitorCoordinator {
     }()
 
     private var tickTimer: Timer?
+    /// Precise one-shot timer for firing the countdown exactly at the grace
+    /// deadline — see `rescheduleGraceTimer()`. The 1 Hz `tickTimer` above
+    /// only adjusts sampling rate and camera-rest bookkeeping now; it no
+    /// longer decides when to alert, since polling once a second can report
+    /// an expired grace period up to ~1 s late.
+    private var graceTimer: Timer?
+    /// Precise one-shot timer that fires the lock at the countdown deadline.
+    /// Same reasoning as `graceTimer`: the 0.25 s `tickTimer` is for redrawing
+    /// the overlay, and polling for the deadline on it landed the lock a
+    /// measured ~0.13 s late on average (0.27 s worst case).
+    private var lockTimer: Timer?
     /// The seat-continuity chain — see PresenceTracker for the model.
     private var presence = PresenceTracker()
+    /// When the capture session was last asked to start. A countdown deadline
+    /// can fall inside session spin-up on a short grace period, and "no frames
+    /// yet" then means "too early to tell", not "camera broken" — see
+    /// `handleGraceExpired`.
+    private var cameraStartedAt = Date.distantPast
+    /// How long a session gets to deliver its first frame before absence of
+    /// frames is treated as a real failure.
+    private let cameraStartupAllowance: TimeInterval = 3
 
     // Camera rest: while the chain is established and the keyboard/mouse are
     // in sustained use, input alone proves presence — the capture session
@@ -53,19 +72,21 @@ final class MonitorCoordinator {
     private let cameraMinAwake: TimeInterval = 20
     /// Input silence that wakes the camera back up (user-configurable).
     private var cameraWakeQuiet: TimeInterval { Settings.cameraWakeQuiet }
-    /// Below this grace period the camera never rests: wake + session spin-up
-    /// + first match takes ~1.5 s, which a 1 s grace can't absorb — the
-    /// overlay would flash at the seated user after every typing pause.
-    private let cameraRestMinimumGrace: TimeInterval = 3
-
-    /// Cadence while absence is suspected / countdown running — fast return detection.
-    private let fastAnalysisInterval: TimeInterval = 0.4
+    /// Cadence while absence is suspected / countdown running. Deliberately
+    /// below the sensor's frame period (capped at 3 fps, so 0.333 s) to make
+    /// sure every captured frame is actually analyzed: the previous 0.4 s
+    /// rounded up to two frame periods, silently discarding every other frame
+    /// already paid for, which doubled both the countdown's timing error and
+    /// the time needed to cancel one.
+    private let fastAnalysisInterval: TimeInterval = 0.25
     /// Steady-state cadence while the presence chain is healthy. Scales with
-    /// the grace period — a long grace doesn't need frequent sampling — and is
-    /// capped at 2.5 s so the 3-frame stranger challenge always resolves
-    /// within ~7.5 s of a stranger facing the screen.
+    /// the countdown delay — a long delay doesn't need frequent sampling — and
+    /// is capped at 2.5 s so the 3-frame stranger challenge always resolves
+    /// within ~8 s of a stranger facing the screen. The divisor sets how many
+    /// detection attempts fit inside the delay (~4), which is what keeps one
+    /// bad frame from becoming a blackout.
     private var idleAnalysisInterval: TimeInterval {
-        min(max(Settings.gracePeriod / 3, fastAnalysisInterval), 2.5)
+        min(max(Settings.gracePeriod / 4, fastAnalysisInterval), 2.5)
     }
 
     /// Whether monitoring was active when enrollment began (restored after).
@@ -132,6 +153,8 @@ final class MonitorCoordinator {
         overlay.dismiss()
         enrollment.abort()
         stopTick()
+        stopGraceTimer()
+        stopLockTimer()
         monitor.stop()
         cameraResting = false
         lastDecisionAt = Date() // a real "not watching" decision — see resolveSchedule
@@ -164,51 +187,86 @@ final class MonitorCoordinator {
         inputActiveSince = nil
         lastCameraWake = Date()
         monitor.analysisInterval = idleAnalysisInterval
+        cameraStartedAt = Date()
         monitor.start()
         startTick(interval: 1)
         state = .watching
+        rescheduleGraceTimer()
         verifyCameraStarted()
     }
 
     /// `monitor.start()` spins up the capture session asynchronously and can
     /// fail silently (camera busy, a device-enumeration hiccup right after
-    /// sleep/wake) — confirm a few seconds later that it's actually running,
-    /// otherwise the app would sit in `.watching`, reporting "Watching for
-    /// you" with the camera never having come on: a false sense of safety,
-    /// exactly what the fail-closed design elsewhere is meant to avoid.
+    /// sleep/wake) — confirm a few seconds later that frames are genuinely
+    /// arriving, otherwise the app would sit in `.watching`, reporting
+    /// "Watching for you" with the camera never having come on: a false sense
+    /// of safety, exactly what the fail-closed design elsewhere avoids.
+    ///
+    /// `.alerting` is checked too, not just `.watching`: a grace period at or
+    /// under this allowance expires first, so by the time this runs the app
+    /// may already be counting down off a camera that never started.
     private func verifyCameraStarted() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.state == .watching, !self.monitor.isRunning else { return }
-            self.pause()
-            self.showAlert(
-                title: "Camera failed to start",
-                message: "Lockscreen Dah? could not start the camera, so your screen is NOT being watched. Monitoring has been paused. Try Start Monitoring again; if it keeps failing, check whether another app has the camera open."
-            )
+        // Bound to the session it was scheduled for. Without this, a pending
+        // check from an earlier session judges a newer one: Start, Pause, Start
+        // within the allowance window had the first check fire against a
+        // 1-second-old session, declare a perfectly good camera broken, and
+        // leave monitoring paused — failing open, the one direction this app
+        // must never fail in.
+        let startedAt = cameraStartedAt
+        DispatchQueue.main.asyncAfter(deadline: .now() + cameraStartupAllowance) { [weak self] in
+            guard let self, self.cameraStartedAt == startedAt else { return }
+            guard self.state == .watching || self.isAlerting else { return }
+            guard !self.monitor.hasDeliveredFrame else { return }
+            self.reportCameraFailure()
         }
     }
 
+    private var isAlerting: Bool {
+        if case .alerting = state { return true }
+        return false
+    }
+
+    private func reportCameraFailure() {
+        pause()
+        showAlert(
+            title: "Camera failed to start",
+            message: "Lockscreen Dah? could not start the camera, so your screen is NOT being watched. Monitoring has been paused. Try Start Monitoring again; if it keeps failing, check whether another app has the camera open."
+        )
+    }
+
     private func beginAlert() {
+        stopGraceTimer() // its job is done; lockTimer owns the next deadline
         presence.breakChain() // the countdown is the identity gate
-        let deadline = Date().addingTimeInterval(Settings.countdownDuration)
         monitor.analysisInterval = fastAnalysisInterval
         overlay.show(remaining: Settings.countdownDuration)
-        startTick(interval: 0.25)
+        // Anchored AFTER the overlay is up, not before: show() builds a window
+        // per screen and does an app-activation round trip, and charging that
+        // setup to the user's warning time made the lock fire early on every
+        // single countdown.
+        let deadline = Date().addingTimeInterval(Settings.countdownDuration)
+        startTick(interval: 0.25) // overlay redraw only
         state = .alerting(deadline: deadline)
+        scheduleLockTimer(at: deadline)
     }
 
     private func cancelAlert() {
         guard case .alerting = state else { return }
+        stopLockTimer()
         overlay.dismiss()
         presence.touch()
         monitor.analysisInterval = idleAnalysisInterval
         startTick(interval: 1)
         state = .watching
+        rescheduleGraceTimer()
     }
 
     /// Esc pressed on the countdown overlay. Cancels the countdown, but three
     /// Esc-rescues inside ten minutes means recognition keeps getting you
     /// wrong — pause monitoring instead of locking you out repeatedly.
     private func handleEscCancel() {
+        // Only count a strike that actually rescued a countdown, so an Esc that
+        // cancelled nothing can't push the user toward the failsafe.
+        guard case .alerting = state else { return }
         let now = Date()
         escCancelTimes.append(now)
         escCancelTimes.removeAll { now.timeIntervalSince($0) > escCancelWindow }
@@ -242,6 +300,8 @@ final class MonitorCoordinator {
     private func enterLockedState() {
         overlay.dismiss()
         stopTick()
+        stopGraceTimer()
+        stopLockTimer()
         monitor.stop()
         cameraResting = false
         state = .locked
@@ -256,7 +316,14 @@ final class MonitorCoordinator {
             // absence is actually suspected, not merely because the current
             // frame didn't match (head turned to a second screen is the
             // steady state, and the chain keeps absence at ~0 there).
-            presence.observe(result)
+            // Stamped with the frame's own capture instant, not "now": the
+            // analysis pipeline plus the hop onto this thread is 100-400 ms,
+            // and charging that to absence made the countdown that much late.
+            presence.observe(result, now: result.capturedAt)
+            // Every observation can move lastOwnerSeen forward (or leave it
+            // put) — reschedule unconditionally rather than trying to detect
+            // which; rescheduling to an unchanged deadline is a no-op cost.
+            rescheduleGraceTimer()
         case .alerting:
             // Only a positive owner match (or Esc) dismisses the countdown —
             // an unmatched face alone can't keep the screen open.
@@ -288,6 +355,144 @@ final class MonitorCoordinator {
         tickTimer = nil
     }
 
+    /// Schedules (or reschedules) the precise one-shot timer that fires the
+    /// countdown exactly `gracePeriod` seconds after presence was last
+    /// confirmed. Call this every time `presence`'s `lastOwnerSeen` might
+    /// have moved forward (a fresh observation, Esc-cancel, camera-rest
+    /// touch) — rescheduling to the same deadline when nothing changed is
+    /// harmless. No tolerance is set: unlike `tickTimer`, this one exists
+    /// specifically to be on time.
+    /// The instant the grace clock counts from: the later of "presence was last
+    /// confirmed" and "this capture session delivered its first frame". The
+    /// second term matters because `presence.reset()` stamps `beginWatching`,
+    /// an instant when the camera provably was not looking yet — session
+    /// spin-up to first frame is ~1 s, which a short grace period expires
+    /// entirely inside. Without it, every unlock at grace 1 s blacked out a
+    /// seated user before the camera had produced a usable frame.
+    private var graceAnchor: Date {
+        guard let firstFrame = monitor.firstFrameAt else { return presence.lastOwnerSeen }
+        return max(presence.lastOwnerSeen, firstFrame)
+    }
+
+    private func rescheduleGraceTimer() {
+        scheduleGraceTimer(at: graceAnchor.addingTimeInterval(Settings.gracePeriod))
+    }
+
+    private func scheduleGraceTimer(at deadline: Date) {
+        graceTimer?.invalidate()
+        let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
+            self?.handleGraceExpired()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        graceTimer = timer
+    }
+
+    private func stopGraceTimer() {
+        graceTimer?.invalidate()
+        graceTimer = nil
+    }
+
+    /// Fires at the scheduled deadline. Re-verifies absence has actually
+    /// reached the grace period rather than trusting the timer blindly — a
+    /// safety net in case some path ever refreshes presence without also
+    /// rescheduling, which would otherwise risk a premature alert.
+    private func handleGraceExpired() {
+        guard state == .watching else { return }
+        let now = Date()
+        // Camera rest deliberately stops the session, which is not a failure —
+        // but a countdown started from it could never be cancelled by showing
+        // your face, making the lock unavoidable. Wake the camera and let the
+        // fresh grace period decide instead. Reachable when the deadline is
+        // pulled in under the 1 Hz rest tick (e.g. Start Countdown After is
+        // lowered while resting).
+        if cameraResting {
+            wakeCameraFromRest(now: now)
+            return
+        }
+        guard now.timeIntervalSince(graceAnchor) >= Settings.gracePeriod else {
+            rescheduleGraceTimer()
+            return
+        }
+        // Absence only means something if the camera was actually looking. A
+        // session that has never delivered a frame is evidence of nothing, so
+        // neither black out nor lock on it. Checked before the Instant branch
+        // below so a dead camera can never lock the screen.
+        if !monitor.hasDeliveredFrame {
+            // Still inside session spin-up (first frame lands ~1 s in, which a
+            // short grace period expires inside): too early to call it either
+            // way, so defer the decision to the end of the allowance rather
+            // than alerting or locking on no evidence.
+            let allowanceEnd = cameraStartedAt.addingTimeInterval(cameraStartupAllowance)
+            if now < allowanceEnd {
+                scheduleGraceTimer(at: allowanceEnd)
+            } else {
+                reportCameraFailure()
+            }
+            return
+        }
+        // "Instant": no countdown to run, so lock straight from here. This also
+        // takes the Esc failsafe out of play — there's no overlay to press Esc
+        // on — which is the explicit trade the setting makes.
+        if Settings.locksInstantly {
+            lockNow()
+            return
+        }
+        beginAlert()
+    }
+
+    /// Schedules the precise one-shot lock at the countdown deadline.
+    private func scheduleLockTimer(at deadline: Date) {
+        lockTimer?.invalidate()
+        let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
+            self?.handleCountdownExpired()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        lockTimer = timer
+    }
+
+    private func stopLockTimer() {
+        lockTimer?.invalidate()
+        lockTimer = nil
+    }
+
+    private func handleCountdownExpired() {
+        guard case .alerting(let deadline) = state else { return }
+        // Same defensive re-check as handleGraceExpired: never lock early.
+        guard Date() >= deadline else {
+            scheduleLockTimer(at: deadline)
+            return
+        }
+        lockNow()
+    }
+
+    /// The grace-period setting changed live while already watching — the
+    /// currently-scheduled deadline was computed from the old value, so
+    /// recompute it against the new one immediately rather than waiting for
+    /// the next real presence observation to happen to trigger a reschedule.
+    func gracePeriodSettingChanged() {
+        guard state == .watching else { return }
+        rescheduleGraceTimer()
+    }
+
+    /// Ends camera rest and restarts the capture session. Waking is an identity
+    /// gate — the camera was blind, so the seat may have changed hands. Break
+    /// the chain: face/body may not maintain presence again until one fresh
+    /// positive match lands. The grace clock restarts from the wake (spin-up
+    /// never eats into it) and sampling runs fast, so a facing owner re-matches
+    /// in ~1 s; no match within the grace period means a countdown.
+    private func wakeCameraFromRest(now: Date) {
+        cameraResting = false
+        inputActiveSince = nil
+        lastCameraWake = now
+        presence.breakChain()
+        presence.touch(now: now)
+        monitor.analysisInterval = fastAnalysisInterval
+        cameraStartedAt = now // start() resets frame-delivery liveness
+        monitor.start()
+        rescheduleGraceTimer()
+        verifyCameraStarted() // the restart can fail like any other
+    }
+
     private func handleTick() {
         switch state {
         case .watching:
@@ -300,28 +505,18 @@ final class MonitorCoordinator {
                 // "Never Idle") must end the rest now, not just block the next.
                 let stillIdling = sinceInput < cameraWakeQuiet
                     && cameraRestAfter > 0
-                    && Settings.gracePeriod >= cameraRestMinimumGrace
+                    && Settings.cameraRestAvailable
                 if stillIdling {
                     // Still typing — input is the presence signal.
                     presence.touch(now: now)
+                    rescheduleGraceTimer()
                     return
                 }
-                // Wake: keyboard went quiet, idling was switched off, or grace
-                // dropped below the rest minimum. Waking is an identity gate —
-                // the camera was blind, so the seat may have changed hands.
-                // Break the chain: face/body/input may not maintain presence
-                // again until one fresh positive match lands. The grace clock
-                // restarts from the wake (spin-up never eats into it) and
-                // sampling runs fast, so a facing owner re-matches in ~1 s;
-                // no match within the grace → countdown.
-                cameraResting = false
-                lastCameraWake = now
-                presence.breakChain()
-                presence.touch(now: now)
-                monitor.analysisInterval = fastAnalysisInterval
-                monitor.start()
-                // Let the restarted camera deliver a frame at the fast cadence
-                // before this tick's absence check could second-guess it.
+                // Keyboard went quiet, idling was switched off, or grace dropped
+                // below the rest minimum. Let the restarted camera deliver a
+                // frame at the fast cadence before this tick's absence check
+                // could second-guess it.
+                wakeCameraFromRest(now: now)
                 return
             }
 
@@ -332,34 +527,30 @@ final class MonitorCoordinator {
             if let activeSince = inputActiveSince,
                presence.chainActive,
                cameraRestAfter > 0, // "Never Idle"
-               Settings.gracePeriod >= cameraRestMinimumGrace,
+               Settings.cameraRestAvailable,
                now.timeIntervalSince(activeSince) >= cameraRestAfter,
                now.timeIntervalSince(lastCameraWake) >= cameraMinAwake {
                 cameraResting = true
                 presence.touch(now: now)
+                rescheduleGraceTimer()
                 monitor.stop()
                 return
             }
 
-            let absence = presence.absence(now: now)
-            if absence > Settings.gracePeriod {
-                beginAlert()
-            } else if absence > Settings.gracePeriod / 2 {
-                // Absence suspected — sample faster so a real absence is
-                // confirmed (or refuted) quickly, well before grace runs out.
+            // The alert itself fires off graceTimer, not this poll — this
+            // just picks the sampling rate: faster once absence is actually
+            // suspected, so a real absence is confirmed (or refuted) well
+            // before the grace deadline, cheaper once the chain is healthy.
+            // Same anchor the deadline uses, so cadence and deadline can't disagree.
+            if now.timeIntervalSince(graceAnchor) > Settings.gracePeriod / 2 {
                 monitor.analysisInterval = fastAnalysisInterval
             } else {
-                // Chain healthy — ride the cheap cadence (also restores idle
-                // after a fast episode without needing a positive match).
                 monitor.analysisInterval = idleAnalysisInterval
             }
         case .alerting(let deadline):
-            let remaining = deadline.timeIntervalSinceNow
-            if remaining <= 0 {
-                lockNow()
-            } else {
-                overlay.update(remaining: remaining)
-            }
+            // Redraw only — lockTimer owns the deadline, so this poll's
+            // ~0.13 s average lag no longer delays the lock itself.
+            overlay.update(remaining: max(0, deadline.timeIntervalSinceNow))
         case .paused, .locked, .enrolling:
             break
         }
@@ -408,6 +599,8 @@ final class MonitorCoordinator {
         resumeAfterEnrollment = state != .paused
         overlay.dismiss()
         stopTick()
+        stopGraceTimer()
+        stopLockTimer()
         state = .enrolling
         withCameraPermission { [weak self] in self?.enrollment.begin() }
     }
@@ -416,6 +609,10 @@ final class MonitorCoordinator {
     /// whatever monitoring state enrollment interrupted.
     private func enrollmentFinished() {
         guard state == .enrolling else { return }
+        // The Esc failsafe's advice was "re-enroll your face" — clear the
+        // strikes now that they have, so leftover pre-enrollment strikes can't
+        // trip it again and repeat advice they just followed.
+        escCancelTimes.removeAll()
         if resumeAfterEnrollment {
             beginWatching()
         } else {
@@ -565,7 +762,12 @@ final class MonitorCoordinator {
     }
 
     private func showCameraDeniedAlert() {
-        state = .paused
+        // Full teardown, not a bare `state = .paused`: reached from
+        // beginEnrollment(), which deliberately leaves the capture session
+        // running for the enrollment preview, so assigning the state directly
+        // left the camera live behind a menu reading "Paused" with no path
+        // back (enrollmentFinished() only fires from .enrolling).
+        pause()
         let alert = NSAlert()
         alert.messageText = "Camera access needed"
         alert.informativeText = "Lockscreen Dah? needs the camera to see whether you're at your screen. Enable it in System Settings → Privacy & Security → Camera."
