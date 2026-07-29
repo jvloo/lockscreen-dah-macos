@@ -7,6 +7,42 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-29
+
+Clears the remaining known defects from the v1.2.0 review, and adds the test
+coverage that would have caught most of what that review found by hand.
+
+### Added
+
+- A test target (`swift test`, 32 tests) covering `PresenceTracker` and
+  `Settings` — the two pure value types where every presence and timing bug in
+  this project has actually lived. It pins down seat continuity, the stranger
+  streak, the identity gates, the duration clamps, Active Hours boundary
+  resolution including overnight ranges, and the "a confirmed stranger's own
+  face must not refresh the presence clock" rule. Verified by reintroducing two
+  of the fixed bugs and confirming the relevant tests fail. `Settings` tests run
+  against a scratch defaults suite, never the real app domain.
+
+### Fixed
+
+- Enrollment could race the capture session. The preview layer was built from
+  the same `AVCaptureSession` the monitor was still configuring on its own
+  queue — concurrent mutation of one session from two threads, which
+  AVFoundation doesn't support (black preview, or a thrown exception adding the
+  connection). Reachable by enrolling before monitoring had ever started, e.g.
+  from a cold launch off hours. The preview now waits for configuration to
+  finish.
+- A capture session that hit a runtime error (camera unplugged, device seized by
+  another app, wedged after a sleep/wake device re-enumeration) stayed broken for
+  the rest of the app's life: the "already configured" flag latched, so no later
+  start would rebuild the inputs. The session's configuration is now torn down on
+  a runtime error, so the next start reconstructs it against whatever device is
+  present.
+- A display attached or rearranged mid-countdown was left uncovered, mirroring
+  or extending the desktop the blackout exists to hide. The overlay now rebuilds
+  for the new screen layout — without replaying the chime or restarting the
+  fade, so plugging in a monitor doesn't look like a fresh countdown.
+
 ## [1.2.0] - 2026-07-29
 
 A timing-accuracy release. Both deadlines the app promises (when the countdown
@@ -231,7 +267,8 @@ new Instant option added. Timings below were measured, not estimated.
 See the [Security audit](README.md#security-audit) section in the README for
 the full findings list.
 
-[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.2.1
 [1.2.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.2.0
 [1.1.2]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.2
 [1.1.1]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.1

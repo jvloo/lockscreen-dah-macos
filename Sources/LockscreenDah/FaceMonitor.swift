@@ -74,6 +74,33 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
 
     init(recognizer: FaceRecognizer) {
         self.recognizer = recognizer
+        super.init()
+        // A session that hits a runtime error (camera unplugged, device seized
+        // by another process, wedged after a sleep/wake device re-enumeration)
+        // stays broken forever otherwise: `configured` latches true, so no
+        // later start() would ever rebuild the inputs. Drop the whole
+        // configuration so the next start() reconstructs it from scratch.
+        NotificationCenter.default.addObserver(
+            forName: .AVCaptureSessionRuntimeError,
+            object: session,
+            queue: nil
+        ) { [weak self] _ in
+            self?.queue.async { self?.teardownConfiguration() }
+        }
+    }
+
+    /// Returns the session to its pre-configuration state so a subsequent
+    /// `start()` re-runs `configureIfNeeded()` against whatever device is
+    /// present now. Must run on `queue`.
+    private func teardownConfiguration() {
+        guard configured else { return }
+        if session.isRunning { session.stopRunning() }
+        session.beginConfiguration()
+        session.inputs.forEach(session.removeInput)
+        session.outputs.forEach(session.removeOutput)
+        session.commitConfiguration()
+        configured = false
+        resetLiveness()
     }
 
     var analysisInterval: TimeInterval {
@@ -86,14 +113,28 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         set { stateLock.lock(); enrollmentMode = newValue; stateLock.unlock() }
     }
 
-    func start() {
+    /// `completion` runs on the main queue once configuration and startRunning
+    /// have finished, whether or not they succeeded. The enrollment preview
+    /// needs it: building an `AVCaptureVideoPreviewLayer` from `session` while
+    /// this queue is still inside `beginConfiguration`/`addOutput` is
+    /// concurrent mutation of one session from two threads, which
+    /// AVFoundation does not support (black preview, or a thrown exception on
+    /// the connection add).
+    func start(completion: (() -> Void)? = nil) {
         queue.async {
             self.configureIfNeeded()
-            guard self.configured, !self.session.isRunning else { return }
-            // Reset liveness only for a genuine (re)start, so an already-running
-            // session's proven frame delivery isn't discarded by a no-op call.
-            self.resetLiveness()
-            self.session.startRunning()
+            if self.configured, !self.session.isRunning {
+                // Reset liveness only for a genuine (re)start, so an
+                // already-running session's proven frame delivery isn't
+                // discarded by a no-op call.
+                self.resetLiveness()
+                self.session.startRunning()
+            }
+            // Fires even when configuration failed, so a caller waiting to show
+            // UI is never left hanging on a machine with no usable camera.
+            if let completion {
+                DispatchQueue.main.async(execute: completion)
+            }
         }
     }
 

@@ -15,9 +15,38 @@ final class CountdownOverlay: NSObject {
 
     private var windows: [NSWindow] = []
     private var countdownLabels: [NSTextField] = []
+    /// Last value passed to `show`/`update`, so a rebuild can redraw immediately.
+    private var lastRemaining: TimeInterval = 0
+    private var screenObserver: NSObjectProtocol?
 
     func show(remaining: TimeInterval) {
         dismiss()
+        // A display attached (or rearranged) mid-countdown would otherwise stay
+        // uncovered, mirroring or extending the desktop the overlay exists to
+        // hide. Rebuilding covers the new layout — without replaying the chime
+        // or restarting the fade, which would make a monitor being plugged in
+        // look like a fresh countdown.
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.windows.isEmpty else { return }
+            self.buildWindows(remaining: self.lastRemaining, fadeIn: false)
+        }
+        buildWindows(remaining: remaining, fadeIn: true)
+        if let chime = NSSound(named: "Tink") {
+            chime.volume = 0.5
+            chime.play()
+        }
+    }
+
+    private func buildWindows(remaining: TimeInterval, fadeIn: Bool) {
+        for window in windows {
+            window.orderOut(nil)
+        }
+        windows.removeAll()
+        countdownLabels.removeAll()
+
         for screen in NSScreen.screens {
             let window = EscapableWindow(
                 contentRect: screen.frame,
@@ -47,7 +76,7 @@ final class CountdownOverlay: NSObject {
             ])
             window.contentView = content
 
-            window.alphaValue = 0
+            window.alphaValue = fadeIn ? 0 : 1
             window.orderFrontRegardless()
             windows.append(window)
         }
@@ -58,6 +87,7 @@ final class CountdownOverlay: NSObject {
         NSApp.activate(ignoringOtherApps: true)
 
         update(remaining: remaining)
+        guard fadeIn else { return }
         NSAnimationContext.runAnimationGroup { context in
             // Short enough that the countdown is legible almost immediately:
             // the fade is subtracted from the warning the user actually gets,
@@ -67,13 +97,10 @@ final class CountdownOverlay: NSObject {
                 window.animator().alphaValue = 1
             }
         }
-        if let chime = NSSound(named: "Tink") {
-            chime.volume = 0.5
-            chime.play()
-        }
     }
 
     func update(remaining: TimeInterval) {
+        lastRemaining = remaining
         let seconds = max(0, Int(remaining.rounded(.up)))
         let text = "\(seconds)"
         for label in countdownLabels where label.stringValue != text {
@@ -82,6 +109,10 @@ final class CountdownOverlay: NSObject {
     }
 
     func dismiss() {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+            self.screenObserver = nil
+        }
         for window in windows {
             window.orderOut(nil)
         }

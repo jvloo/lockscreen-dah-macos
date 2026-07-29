@@ -8,6 +8,11 @@ let package = Package(
         .executableTarget(
             name: "LockscreenDah",
             path: "Sources/LockscreenDah"
-        )
+        ),
+        .testTarget(
+            name: "LockscreenDahTests",
+            dependencies: ["LockscreenDah"],
+            path: "Tests/LockscreenDahTests"
+        ),
     ]
 )

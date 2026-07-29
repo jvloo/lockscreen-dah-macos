@@ -1,7 +1,9 @@
 import Foundation
 
 enum Settings {
-    private static let defaults = UserDefaults.standard
+    /// Overridable purely so tests can point at a scratch suite instead of the
+    /// real user defaults; production code never reassigns it.
+    static var defaults = UserDefaults.standard
 
     /// Single point for the "stored value or default" read every setting uses.
     private static func value<T>(forKey key: String, default fallback: T) -> T {

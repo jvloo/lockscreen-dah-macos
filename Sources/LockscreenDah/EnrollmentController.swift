@@ -71,13 +71,21 @@ final class EnrollmentController {
 
         monitor.collectEnrollmentSamples = true
         monitor.analysisInterval = 0.25
-        monitor.start()
-        panel.show(session: monitor.session, totalSamples: totalSamples)
-        panel.setInstruction(stages[0].instruction)
-        panel.setStatus("Position your face in the oval.")
-        panel.setPrimary(title: "Start")
-        panel.setSecondary(title: nil)
-        panel.setCancelVisible(true)
+        // The preview layer attaches to the same AVCaptureSession the monitor
+        // configures on its own queue, so it must wait until that finishes —
+        // see FaceMonitor.start(completion:). Guarded because the user can
+        // cancel during the (brief) session setup: abort() clears this flag,
+        // whereas `phase` returns to .ready either way and can't tell the two
+        // apart.
+        monitor.start { [weak self] in
+            guard let self, self.monitor.collectEnrollmentSamples else { return }
+            self.panel.show(session: self.monitor.session, totalSamples: self.totalSamples)
+            self.panel.setInstruction(self.stages[0].instruction)
+            self.panel.setStatus("Position your face in the oval.")
+            self.panel.setPrimary(title: "Start")
+            self.panel.setSecondary(title: nil)
+            self.panel.setCancelVisible(true)
+        }
     }
 
     /// Tears the flow down without firing `onFinished` — for when the

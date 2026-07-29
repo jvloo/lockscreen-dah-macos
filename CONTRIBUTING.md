@@ -35,18 +35,33 @@ with Hardened Runtime. See `Package.swift` and `build.sh`.
 
 ## Testing your change
 
-There's no automated test target — the app is almost entirely driven by
-camera input and OS-level state (lock/unlock, sleep/wake, schedule
-boundaries) that's impractical to unit-test in isolation. Verify changes by
-running the app:
+```sh
+swift test
+```
+
+`PresenceTracker` and `Settings` are pure value types with no AppKit or camera
+dependency, and they're where every presence and timing bug in this project has
+actually lived — so they're covered directly. If you change the presence chain,
+the duration clamps, or the Active Hours boundary maths, **add or update a test
+there**; several past bugs were the fix for an earlier bug, which is exactly
+what these catch.
+
+`Settings` tests must run against a scratch `UserDefaults` suite, never the real
+app domain (see `SettingsTests.setUp`) — otherwise they'd clobber the tester's
+own configuration.
+
+The rest of the app is driven by camera input and OS-level state (lock/unlock,
+sleep/wake, schedule boundaries) that isn't practical to unit-test in isolation,
+so verify those by running it:
 
 - `./build.sh --install` and exercise the affected flow end-to-end from the
   menu bar.
-- For anything touching `MonitorCoordinator`'s state machine or the Active
-  Hours schedule, walk through the actual state transitions rather than
-  trusting a read-through — this logic is easy to get subtly wrong around
-  lock/unlock and sleep, and past bugs here have only shown up in exactly
-  those edge cases.
+- For anything touching `MonitorCoordinator`'s state machine, walk through the
+  actual state transitions rather than trusting a read-through — this logic is
+  easy to get subtly wrong around lock/unlock, sleep, and camera rest, and past
+  bugs here have only shown up in exactly those edge cases. Pay particular
+  attention to timing: the countdown and lock deadlines are precise one-shot
+  timers, and anything that moves a deadline must also reschedule its timer.
 - For recognition/enrollment changes, re-enroll and confirm both a positive
   match (your face) and a negative one (someone else, or a photo) behave as
   expected.
@@ -71,9 +86,10 @@ e.g. `fix(schedule): ...`, `feat(enrollment): ...` — focus the message on
 ## Pull requests
 
 - Keep each PR focused on one change; unrelated cleanup makes review harder.
-- Describe what you tested manually (see
-  [Testing your change](#testing-your-change)) — with no CI test suite, this
-  is the reviewer's main signal.
+- `swift test` must pass, and logic changes should come with a test.
+- Describe what you tested manually beyond that (see
+  [Testing your change](#testing-your-change)) — most of this app can only be
+  verified by running it, so that's the reviewer's main signal.
 
 ## License
 
