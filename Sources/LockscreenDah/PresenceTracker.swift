@@ -12,28 +12,28 @@ import Foundation
 struct PresenceTracker {
     private(set) var chainActive = false
     private var strangerStreak = 0
-    /// Wall-clock instant presence was last confirmed — the anchor a grace
+    /// Monotonic instant presence was last confirmed — the anchor a grace
     /// deadline is computed from. Exposed so the coordinator can schedule a
     /// precise one-shot timer against it instead of polling.
-    private(set) var lastOwnerSeen: Date
+    private(set) var lastOwnerSeen: TimeInterval
 
     /// Consecutive clear-stranger frames that end the chain.
     private let strangerStreakLimit: Int
 
-    init(now: Date = Date(), strangerStreakLimit: Int = 3) {
+    init(now: TimeInterval = Uptime.now, strangerStreakLimit: Int = 3) {
         lastOwnerSeen = now
         self.strangerStreakLimit = strangerStreakLimit
     }
 
     /// Fresh start (monitoring begins): no chain until the owner is matched.
-    mutating func reset(now: Date = Date()) {
+    mutating func reset(now: TimeInterval = Uptime.now) {
         chainActive = false
         strangerStreak = 0
         lastOwnerSeen = now
     }
 
     /// Owner positively matched — (re)establish the chain.
-    mutating func establish(now: Date = Date()) {
+    mutating func establish(now: TimeInterval = Uptime.now) {
         chainActive = true
         strangerStreak = 0
         lastOwnerSeen = now
@@ -46,14 +46,14 @@ struct PresenceTracker {
     }
 
     /// Restarts the grace period without re-establishing identity (Esc cancel).
-    mutating func touch(now: Date = Date()) {
+    mutating func touch(now: TimeInterval = Uptime.now) {
         lastOwnerSeen = now
     }
 
     /// Folds one detection into the chain. Returns true when the owner was
     /// positively matched.
     @discardableResult
-    mutating func observe(_ result: DetectionResult, now: Date = Date()) -> Bool {
+    mutating func observe(_ result: DetectionResult, now: TimeInterval = Uptime.now) -> Bool {
         if result.ownerMatched {
             establish(now: now)
             return true

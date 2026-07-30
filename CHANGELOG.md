@@ -7,41 +7,140 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.2.1] - 2026-07-29
+## [1.3.0] - 2026-07-29
 
-Clears the remaining known defects from the v1.2.0 review, and adds the test
-coverage that would have caught most of what that review found by hand.
+Adds Active Days, makes the countdown and lock deadlines immune to system clock
+changes, and clears the last known defects from the v1.2.0 review — with test
+coverage for the logic all of that touches.
 
 ### Added
 
-- A test target (`swift test`, 32 tests) covering `PresenceTracker` and
+- **Active Days.** The schedule now has a day-of-week filter alongside its hour
+  range, defaulting to **Mon–Fri**. Set it in the same panel (menu bar →
+  Settings → Active Hours…), which gains a row of weekday checkboxes and an
+  "All days" toggle. At least one day must stay selected: an empty set would
+  mean monitoring never runs, which reads as configured protection but provides
+  none. The menu shows the current schedule ("Active Hours (9:00 AM–8:00 PM,
+  Mon–Fri)…"), and the status line distinguishes "Paused (off hours)" from
+  "Paused (Sat not active)", since the latter is easy to forget you configured.
+
+  Hours and days resolve through **one** model: each active weekday opens a
+  single window at the start time lasting the configured span. Overnight ranges
+  fall out for free and are governed by the day they *opened* on, so a Friday
+  21:00–06:00 shift stays active into Saturday morning even when Saturday isn't
+  selected. Adjacent windows are merged, so a fully continuous schedule (every
+  day, 24 hours) still exposes no boundary and a manual pause survives it.
+- A test target (`swift test`, 51 tests) covering `PresenceTracker` and
   `Settings` — the two pure value types where every presence and timing bug in
   this project has actually lived. It pins down seat continuity, the stranger
-  streak, the identity gates, the duration clamps, Active Hours boundary
-  resolution including overnight ranges, and the "a confirmed stranger's own
-  face must not refresh the presence clock" rule. Verified by reintroducing two
-  of the fixed bugs and confirming the relevant tests fail. `Settings` tests run
-  against a scratch defaults suite, never the real app domain.
+  streak, the identity gates, the duration clamps, and schedule/day resolution
+  including overnight ranges. Verified by reintroducing two of the fixed bugs
+  and confirming the relevant tests fail. `Settings` tests run against a scratch
+  defaults suite, never the real app domain.
+
+### Changed
+
+- The zero-countdown option is now labelled **Never Countdown** (was "Instant"),
+  matching the existing "Never Idle" wording. Behaviour is unchanged: the screen
+  locks the moment presence lapses, with no overlay. Since that also removes the
+  Esc gesture, a lock-loop fallback covers it (below).
+- Every stored setting is now range-checked on read, and the schedule panel
+  refuses invalid combinations instead of reinterpreting them. Equal start and
+  end times are rejected (they had no honest reading — a whole day, or none of
+  it?), as is an empty day selection. Start/end minutes are clamped to a real
+  time of day, because an out-of-range value reached `date(bySettingHour:)` as
+  e.g. hour 83, which returns nil and would have silently dropped the day's
+  window and left monitoring never starting. "Idle When Typing For" and "Wake
+  From Idle After" are clamped too. The 24-hour schedule is now expressed by
+  "Always on" alone.
+- **Esc no longer cancels a countdown on its own.** A single un-checked keypress
+  that dismisses a lock was the bypass an intruder would reach for, so it now
+  takes three presses on the *same* overlay, which then asks the Mac to verify
+  who is pressing. The gesture is only revealed after the first press, so a
+  passerby still sees a blank screen. The lock is held while the prompt is up;
+  dismissing or failing it restores the countdown exactly where it was, so an
+  intruder gains nothing and the screen still locks.
+- Camera idling's blind window is **left unbounded, deliberately**, and that is
+  now written down rather than implied. While resting the camera is stopped and
+  presence rests on keystrokes alone — and unlike the body-detection gap it isn't
+  bounded in practice either, because an intruder holding a key keeps input
+  flowing, which is exactly what keeps the camera asleep. A 10 s ceiling with a
+  2 s "peek" was built and measured, but enforcing it reopens the camera every
+  10 s forever (~10–18% duty cycle against ~0%, re-running auto-exposure each
+  time), which wasn't judged worth paying continuously. The machinery remains in
+  the code behind `cameraRestMaxDuration`. **The supported answer to this threat
+  is "Never Idle"**, which removes the window entirely at a steady CPU cost. See
+  [docs/TESTING.md](docs/TESTING.md) entry 2 for the attack and the tradeoff.
+- **"Never Countdown" can no longer trap you in a lock loop.** With no overlay
+  there is no Esc gesture, and a recognizer that has stopped matching you would
+  lock the screen again seconds after every login with no in-app way out. Locks
+  with no successful match in between are now counted — persisted, since each
+  iteration passes through a screen lock — and after two of them a minimum 3 s
+  countdown is restored so the escape gesture exists again. Any real match clears
+  it and instant locking resumes.
+- The lock during that verification is **deferred, never cancelled** (bounded at
+  15 s). An earlier cut of this stopped every timer that could fire the lock and
+  relied on the prompt's completion handler to restart them, so a prompt nobody
+  answered parked the app in `.alerting` indefinitely with the overlay up and the
+  machine unlocked behind what reads as a sleeping display. Silence is not
+  authorisation: when the grace expires the prompt is invalidated and the screen
+  locks. Verification attempts are also capped per overlay — without that, every
+  press after the third re-prompted, so an intruder could keep deferring.
+- Passing that verification pauses monitoring, which then **will not resume
+  automatically** — not on a schedule boundary, an unlock, or a display wake —
+  until you re-enroll. The requirement is persisted, so quitting can't clear it,
+  and your existing profile keeps working until the new one is saved.
+- Added [docs/TESTING.md](docs/TESTING.md): a manual checklist for everything
+  tests can't reach, plus a watch list of deliberately-accepted risks with what
+  to look for in each.
+- The countdown and lock deadlines are now measured on a **monotonic clock**
+  instead of wall-clock time. A forward system clock step (a manual date change,
+  or `timed` stepping rather than slewing an NTP correction) used to fire both
+  that much early, and both defensive re-checks were written against the same
+  shifted clock so neither could catch it. Active Hours deliberately still
+  follows wall-clock time: if the system date changes, the schedule should move
+  with it.
 
 ### Fixed
 
+- **Ticking "Always on" left monitoring off while the UI said it was on.** The
+  schedule panel writes `scheduleEnabled` before notifying the coordinator, and
+  the coordinator's handler guarded on that same flag — so the one change that
+  expands coverage to 24/7 guarded itself out. The periodic resolver carried the
+  same guard, so nothing recovered it short of a relaunch, which is why it
+  survived testing. From a paused state the app now starts as instructed.
+- `consecutiveLocksWithoutMatch` was the one security control read without a
+  range check. A stored negative made the threshold test unreachable and silently
+  removed the only failsafe against a "Never Countdown" lock loop. Now clamped and
+  saturated, like every other control.
+- `countdownDuration` shared the generic 0.5 s duration floor, so
+  `defaults write` could produce a countdown shorter than the Esc gesture that is
+  explicitly sized against it ("three presses plus a Touch ID round trip"). It now
+  has its own floor of 3 s — the shortest offered value. `gracePeriod` keeps the
+  lower shared floor on purpose, so camera idling can still be ruled unavailable.
 - Enrollment could race the capture session. The preview layer was built from
   the same `AVCaptureSession` the monitor was still configuring on its own
   queue — concurrent mutation of one session from two threads, which
   AVFoundation doesn't support (black preview, or a thrown exception adding the
   connection). Reachable by enrolling before monitoring had ever started, e.g.
-  from a cold launch off hours. The preview now waits for configuration to
-  finish.
+  a cold launch off hours. The preview now waits for configuration to finish.
 - A capture session that hit a runtime error (camera unplugged, device seized by
   another app, wedged after a sleep/wake device re-enumeration) stayed broken for
   the rest of the app's life: the "already configured" flag latched, so no later
-  start would rebuild the inputs. The session's configuration is now torn down on
-  a runtime error, so the next start reconstructs it against whatever device is
-  present.
+  start would rebuild the inputs. Configuration is now torn down on a runtime
+  error and reconstructed on the next start.
 - A display attached or rearranged mid-countdown was left uncovered, mirroring
   or extending the desktop the blackout exists to hide. The overlay now rebuilds
   for the new screen layout — without replaying the chime or restarting the
   fade, so plugging in a monitor doesn't look like a fresh countdown.
+
+### Upgrading
+
+- Monitoring now pauses at weekends by default. Pick **All days** in the Active
+  Hours panel to keep the previous behaviour.
+- A stored duration no longer offered in the menus (a 30 s delay, a 1 s
+  countdown) stays in effect until you pick a new one — settings are not
+  rewritten behind your back.
 
 ## [1.2.0] - 2026-07-29
 
@@ -267,8 +366,8 @@ new Instant option added. Timings below were measured, not estimated.
 See the [Security audit](README.md#security-audit) section in the README for
 the full findings list.
 
-[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.2.1...HEAD
-[1.2.1]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.2.1
+[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.3.0
 [1.2.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.2.0
 [1.1.2]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.2
 [1.1.1]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.1

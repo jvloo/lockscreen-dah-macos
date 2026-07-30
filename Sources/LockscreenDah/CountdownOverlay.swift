@@ -7,14 +7,18 @@ import AVFoundation
 /// to the owner nearby the sudden blackout plus a soft chime is the cue to
 /// come back.
 ///
-/// Cancelling: facing the screen is the intended cancel (face match). Esc also
-/// works but is deliberately not advertised on screen; clicks do nothing, so a
-/// curious passerby can't reveal the desktop.
+/// Cancelling: facing the screen is the intended cancel (face match). Esc no
+/// longer cancels on its own — three presses on the same overlay ask for Touch
+/// ID instead, so there is no unauthenticated way to dismiss a countdown. The
+/// prompt for that is only revealed after the first press, so a passerby sees
+/// nothing; clicks do nothing either.
 final class CountdownOverlay: NSObject {
-    var onCancel: (() -> Void)?
+    var onEscape: (() -> Void)?
 
     private var windows: [NSWindow] = []
     private var countdownLabels: [NSTextField] = []
+    private var hintLabels: [NSTextField] = []
+    private var hint: String?
     /// Last value passed to `show`/`update`, so a rebuild can redraw immediately.
     private var lastRemaining: TimeInterval = 0
     private var screenObserver: NSObjectProtocol?
@@ -46,6 +50,7 @@ final class CountdownOverlay: NSObject {
         }
         windows.removeAll()
         countdownLabels.removeAll()
+        hintLabels.removeAll()
 
         for screen in NSScreen.screens {
             let window = EscapableWindow(
@@ -59,7 +64,7 @@ final class CountdownOverlay: NSObject {
             window.backgroundColor = .black
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             window.isReleasedWhenClosed = false
-            window.onEscape = { [weak self] in self?.onCancel?() }
+            window.onEscape = { [weak self] in self?.onEscape?() }
 
             let countdown = NSTextField(labelWithString: "")
             countdown.font = .monospacedDigitSystemFont(ofSize: 42, weight: .medium)
@@ -68,11 +73,21 @@ final class CountdownOverlay: NSObject {
             countdown.translatesAutoresizingMaskIntoConstraints = false
             countdownLabels.append(countdown)
 
+            let hintLabel = NSTextField(labelWithString: "")
+            hintLabel.font = .systemFont(ofSize: 13, weight: .regular)
+            hintLabel.textColor = NSColor.white.withAlphaComponent(0.28)
+            hintLabel.alignment = .right
+            hintLabel.translatesAutoresizingMaskIntoConstraints = false
+            hintLabels.append(hintLabel)
+
             let content = NSView(frame: screen.frame)
             content.addSubview(countdown)
+            content.addSubview(hintLabel)
             NSLayoutConstraint.activate([
                 countdown.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -44),
                 countdown.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -36),
+                hintLabel.trailingAnchor.constraint(equalTo: countdown.trailingAnchor),
+                hintLabel.bottomAnchor.constraint(equalTo: countdown.topAnchor, constant: -6),
             ])
             window.contentView = content
 
@@ -87,6 +102,7 @@ final class CountdownOverlay: NSObject {
         NSApp.activate(ignoringOtherApps: true)
 
         update(remaining: remaining)
+        applyHint()
         guard fadeIn else { return }
         NSAnimationContext.runAnimationGroup { context in
             // Short enough that the countdown is legible almost immediately:
@@ -118,6 +134,22 @@ final class CountdownOverlay: NSObject {
         }
         windows.removeAll()
         countdownLabels.removeAll()
+        hintLabels.removeAll()
+        hint = nil
+    }
+
+    /// Revealed only once the user has actually pressed Esc, so the gesture
+    /// isn't advertised to someone walking past a blacked-out screen.
+    func setHint(_ text: String?) {
+        hint = text
+        applyHint()
+    }
+
+    private func applyHint() {
+        let text = hint ?? ""
+        for label in hintLabels where label.stringValue != text {
+            label.stringValue = text
+        }
     }
 }
 

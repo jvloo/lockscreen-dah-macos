@@ -66,14 +66,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let isPaused = coordinator.state == .paused
+        // Recognition already proved unreliable, so the way back is through a
+        // fresh profile — say that on the button rather than offering a plain
+        // Start that would silently do nothing.
+        let needsReenrollment = isPaused && Settings.reenrollmentRequired
+        let toggleTitle: String
+        if needsReenrollment {
+            toggleTitle = "Re-Enroll to Resume"
+        } else {
+            toggleTitle = isPaused ? "Start Monitoring" : "Pause Monitoring"
+        }
         let toggle = NSMenuItem(
-            title: isPaused ? "Start Monitoring" : "Pause Monitoring",
+            title: toggleTitle,
             action: #selector(toggleMonitoring),
             keyEquivalent: ""
         )
         toggle.target = self
         toggle.image = NSImage(
-            systemSymbolName: isPaused ? "play.fill" : "pause.fill",
+            systemSymbolName: needsReenrollment ? "arrow.clockwise" : (isPaused ? "play.fill" : "pause.fill"),
             accessibilityDescription: nil
         )
         menu.addItem(toggle)
@@ -184,14 +194,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             options: Settings.countdownOptions,
             get: { Settings.countdownDuration },
             set: { Settings.countdownDuration = $0 },
-            rowLabel: { $0 == 0 ? "Instant (no countdown)" : "\(Int($0)) seconds" },
-            valueLabel: { $0 == 0 ? "Instant" : "\(Int($0))s" }
+            rowLabel: { $0 == 0 ? "Never Countdown" : "\(Int($0)) seconds" },
+            valueLabel: { $0 == 0 ? "Never" : "\(Int($0))s" }
         ))
         settingsMenu.addItem(idleItem)
         settingsMenu.addItem(wakeItem)
-        let hoursTitle = Settings.scheduleEnabled
-            ? "Active Hours (\(Settings.formatMinutes(Settings.scheduleStartMinutes))–\(Settings.formatMinutes(Settings.scheduleEndMinutes)))…"
-            : "Active Hours (always on)…"
+        let hoursTitle: String
+        if Settings.scheduleEnabled {
+            let span = "\(Settings.formatMinutes(Settings.scheduleStartMinutes))–\(Settings.formatMinutes(Settings.scheduleEndMinutes))"
+            hoursTitle = "Active Hours (\(span), \(Settings.formatActiveDays()))…"
+        } else {
+            hoursTitle = "Active Hours (always on)…"
+        }
         let hours = NSMenuItem(title: hoursTitle, action: #selector(showActiveHours), keyEquivalent: "")
         hours.target = self
         settingsMenu.addItem(hours)
@@ -230,6 +244,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let submenu = NSMenu(title: title)
         submenu.autoenablesItems = false
 
+        // A value chosen from an earlier build's list (say a 15 s idle delay that
+        // is no longer offered) is still in effect, so it gets its own row rather
+        // than leaving every row unticked — which reads as "nothing is set".
+        // Settings are never rewritten behind the user's back to force a match.
+        var options = options
+        if !options.contains(get()) {
+            let never = options.filter { $0 == 0 } // 0 renders as "Never", stays last
+            options = (options.filter { $0 != 0 } + [get()]).sorted() + never
+        }
+
         var views: [(StayOpenOptionView, TimeInterval)] = []
         for option in options {
             let view = StayOpenOptionView(title: row(option))
@@ -258,10 +282,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleMonitoring() {
-        if coordinator.state == .paused {
-            coordinator.startMonitoring()
-        } else {
+        guard coordinator.state == .paused else {
             coordinator.pause()
+            return
+        }
+        // The only route past an outstanding re-enrollment requirement. The
+        // existing profile stays in use until the new one is saved, so a
+        // cancelled enrollment leaves you no worse off.
+        if Settings.reenrollmentRequired {
+            coordinator.enrollFace()
+        } else {
+            coordinator.startMonitoring()
         }
     }
 

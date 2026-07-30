@@ -1,8 +1,8 @@
 import AppKit
 
-/// Compact settings panel for Active Hours: an "Always on" checkbox and
-/// hour:minute pickers for start/end. Edits are local until Save — Cancel
-/// discards them.
+/// Compact settings panel for the monitoring schedule: an "Always on"
+/// checkbox, hour:minute pickers for start/end, and the weekdays it runs on.
+/// Edits are local until Save — Cancel discards them.
 final class ActiveHoursPanel: NSObject {
     /// Fired after Save so the coordinator can enforce the new schedule.
     var onSettingsChanged: (() -> Void)?
@@ -11,6 +11,9 @@ final class ActiveHoursPanel: NSObject {
     private var alwaysOnCheckbox: NSButton?
     private var startPicker: NSDatePicker?
     private var endPicker: NSDatePicker?
+    private var allDaysCheckbox: NSButton?
+    /// Keyed by `Calendar` weekday number (1 = Sunday).
+    private var dayCheckboxes: [Int: NSButton] = [:]
 
     func show() {
         if let panel {
@@ -19,7 +22,7 @@ final class ActiveHoursPanel: NSObject {
             return
         }
 
-        let panel = NSPanel.floating(title: "Active Hours")
+        let panel = NSPanel.floating(title: "Active Hours & Days")
 
         // Checked = ignore the schedule entirely.
         let alwaysOn = NSButton(
@@ -56,8 +59,36 @@ final class ActiveHoursPanel: NSObject {
             grid.row(at: row).yPlacement = .center
         }
 
+        let allDays = NSButton(
+            checkboxWithTitle: "All days",
+            target: self,
+            action: #selector(toggleAllDays)
+        )
+        allDaysCheckbox = allDays
+
+        // Monday-first, which is how a work week reads — Calendar numbers
+        // Sunday as 1, so display order is explicit rather than 1...7.
+        var dayButtons: [NSView] = []
+        for weekday in Settings.weekdayDisplayOrder {
+            let box = NSButton(
+                checkboxWithTitle: Settings.weekdayName(weekday),
+                target: self,
+                action: #selector(toggleDay)
+            )
+            box.tag = weekday
+            dayCheckboxes[weekday] = box
+            dayButtons.append(box)
+        }
+        let dayRow = NSStackView(views: dayButtons)
+        dayRow.orientation = .horizontal
+        dayRow.spacing = 8
+        dayRow.alignment = .centerY
+
+        let daysLabel = NSTextField(labelWithString: "Days:")
+        daysLabel.font = .systemFont(ofSize: 13)
+
         // Everything hangs off the same leading edge.
-        let stack = NSStackView(views: [alwaysOn, grid])
+        let stack = NSStackView(views: [alwaysOn, grid, daysLabel, dayRow, allDays])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -88,7 +119,7 @@ final class ActiveHoursPanel: NSObject {
         panel.contentView = content
         refreshControls()
         var size = content.fittingSize
-        size.width = max(size.width, 330) // breathing room beyond the tight fit
+        size.width = max(size.width, 430) // wide enough for seven day checkboxes
         panel.setContentSize(size)
         panel.center()
         panel.present()
@@ -112,6 +143,22 @@ final class ActiveHoursPanel: NSObject {
         endPicker?.isEnabled = !alwaysOn
         startPicker?.dateValue = Self.date(fromMinutes: Settings.scheduleStartMinutes)
         endPicker?.dateValue = Self.date(fromMinutes: Settings.scheduleEndMinutes)
+
+        let days = Settings.activeDays
+        for (weekday, box) in dayCheckboxes {
+            box.state = days.contains(weekday) ? .on : .off
+        }
+        allDaysCheckbox?.state = days.count == 7 ? .on : .off
+        setDayControlsEnabled(!alwaysOn)
+    }
+
+    private func setDayControlsEnabled(_ enabled: Bool) {
+        allDaysCheckbox?.isEnabled = enabled
+        dayCheckboxes.values.forEach { $0.isEnabled = enabled }
+    }
+
+    private var checkedDays: Set<Int> {
+        Set(dayCheckboxes.filter { $0.value.state == .on }.keys)
     }
 
     // MARK: - Actions
@@ -121,18 +168,80 @@ final class ActiveHoursPanel: NSObject {
         let alwaysOn = alwaysOnCheckbox?.state == .on
         startPicker?.isEnabled = !alwaysOn
         endPicker?.isEnabled = !alwaysOn
+        setDayControlsEnabled(!alwaysOn)
+    }
+
+    @objc private func toggleAllDays() {
+        let all = allDaysCheckbox?.state == .on
+        // Unticking "All days" would otherwise leave every day selected and the
+        // checkbox contradicting them, so fall back to the default work week.
+        let target = all ? Set(1...7) : Settings.defaultActiveDays
+        for (weekday, box) in dayCheckboxes {
+            box.state = target.contains(weekday) ? .on : .off
+        }
+    }
+
+    @objc private func toggleDay(_ sender: NSButton) {
+        // At least one day must stay selected: an empty set would mean
+        // monitoring never runs, which reads as "protected" but isn't.
+        if checkedDays.isEmpty {
+            sender.state = .on
+            NSSound.beep()
+            return
+        }
+        allDaysCheckbox?.state = checkedDays.count == 7 ? .on : .off
     }
 
     @objc private func saveTapped() {
-        Settings.scheduleEnabled = alwaysOnCheckbox?.state == .off
-        if let startPicker {
-            Settings.scheduleStartMinutes = Self.minutes(from: startPicker.dateValue)
+        let alwaysOn = alwaysOnCheckbox?.state == .on
+
+        // Only validate what the user can actually edit: when "Always on" is
+        // ticked the schedule controls are disabled, and the stored hours/days
+        // are left untouched so they're still there if it's unticked later.
+        if !alwaysOn {
+            guard let startPicker, let endPicker else { return }
+            let start = Self.minutes(from: startPicker.dateValue)
+            let end = Self.minutes(from: endPicker.dateValue)
+
+            // Equal start and end has no single honest reading — a whole day, or
+            // none of it? Reject rather than silently picking one.
+            guard start != end else {
+                reject(
+                    "Start and end can't be the same time.",
+                    "Choose different times, or tick \u{201C}Always on\u{201D} to monitor around the clock."
+                )
+                return
+            }
+            guard !checkedDays.isEmpty else {
+                reject(
+                    "Choose at least one day.",
+                    "With no days selected, monitoring would never run — which looks configured but protects nothing."
+                )
+                return
+            }
+
+            Settings.scheduleStartMinutes = start
+            Settings.scheduleEndMinutes = end
+            Settings.activeDays = checkedDays
         }
-        if let endPicker {
-            Settings.scheduleEndMinutes = Self.minutes(from: endPicker.dateValue)
-        }
+
+        Settings.scheduleEnabled = !alwaysOn
         onSettingsChanged?()
         panel?.orderOut(nil)
+    }
+
+    /// Refuses the Save and explains why, leaving the panel open with the edits
+    /// intact so the user can correct them.
+    private func reject(_ message: String, _ detail: String) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.alertStyle = .warning
+        if let panel {
+            alert.beginSheetModal(for: panel, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
     }
 
     @objc private func cancelTapped() {

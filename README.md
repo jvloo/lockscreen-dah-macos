@@ -37,13 +37,16 @@ corner. Face the screen again to cancel, or let it expire to lock the Mac.
 - **Camera rests while you type**, waking (and re-verifying identity) on the
   next pause, for near-zero CPU during typing-heavy stretches.
 - **Discreet blackout countdown**: reads as a sleeping display, not a
-  "you're being watched" banner. A face match or Esc cancels it.
+  "you're being watched" banner. A face match cancels it; there is no
+  unauthenticated way to dismiss it.
 - **Guided enrollment**: three staged poses, automatic live verification,
   nothing saved until you confirm.
-- **Active Hours schedule**: auto-starts/pauses on a schedule; manual
-  overrides survive sleep, lock, and multi-day gaps correctly.
-- **Failsafes**: Esc-rescue auto-pause, post-lock verification (never sits
-  in a fake "locked" state), auth-gated re-enrollment.
+- **Active Hours & Days**: auto-starts/pauses on an hour range and a weekday
+  selection (default Mon–Fri); manual overrides survive sleep, lock, and
+  multi-day gaps correctly.
+- **Failsafes**: an authenticated Esc escape for when recognition fails you,
+  a lock-loop fallback that can't strand you, post-lock verification (never
+  sits in a fake "locked" state), auth-gated re-enrollment.
 
 ## Contents
 
@@ -106,7 +109,7 @@ Status line + menu-bar icon per state:
 
 | State | Icon | Status line |
 |---|---|---|
-| Paused | pause.circle | "Paused" / "Paused (off hours)" |
+| Paused | pause.circle | "Paused" / "Paused (off hours)" / "Paused (Sat not active)" |
 | Watching (enrolled) | faceid | "Watching for you" |
 | Watching (no profile) | ⚠️ exclamationmark.triangle.fill | "Watching for any face" |
 | Camera idle (typing) | 💤 moon.zzz.fill | "Idle while typing" |
@@ -121,7 +124,7 @@ Items:
   disabled **Face model missing (run scripts/fetch-model.sh)** if
   `FaceEmbedding.mlmodelc` wasn't bundled
 - **Settings ▸** Start Countdown After / Countdown Duration / Idle When
-  Typing For / Wake From Idle After / Active Hours… / Open at Login:
+  Typing For / Wake From Idle After / Active Hours & Days… / Open at Login:
   option rows apply immediately and keep the menu open; chosen value shows
   in each item's title (see [Settings](#settings))
 - **About Lockscreen Dah?**: intro, author, version, and an update check
@@ -140,9 +143,10 @@ How long presence can lapse before the blackout countdown appears.
 - **Lower** = faster reaction when you leave, but more false blackouts
   (glancing at your phone under the desk), and **higher CPU**: the analysis
   cadence is `delay/4`, floored at 0.25 s and capped at 2.5 s, so 1 s analyzes
-  every frame the sensor produces. At 1 s, camera idling is also unavailable
-  (waking and landing one fresh match doesn't fit inside a 1 s delay) — the
-  menu greys those rows out and says so rather than ignoring them silently.
+  every frame the sensor produces. Camera idling is available at every delay, but
+  note it opens an **unbounded** blind window (see
+  [docs/TESTING.md](docs/TESTING.md#watch-list)) — pick **Never Idle** if you
+  chose a short delay for vigilance.
 - **Higher** = cheaper (10 s analyzes every ~2.7 s) and calmer, but a stranger
   inherits a bigger head start.
 
@@ -163,7 +167,7 @@ It never lands late. Closing the gap further means sampling faster, which is
 the CPU tradeoff above. The clock also doesn't start until the camera has
 delivered its first frame, so opening a session never eats into your delay.
 
-### Countdown Duration (3/5/10 s or Instant, default 3)
+### Countdown Duration (3/5/10 s or Never Countdown, default 3)
 
 Length of the blackout countdown before the lock fires.
 
@@ -174,14 +178,14 @@ Length of the blackout countdown before the lock fires.
   would be a lock with no real appeal, not a warning.
 - **Higher** = more forgiving of false alarms, but extends the total exposure
   window (delay + countdown) before a real lock. A stranger can't cancel it
-  either way: only your face or Esc can.
-- **Instant** = no countdown and no overlay at all; the screen locks the moment
-  presence lapses. Strictest setting, and the only one with **no escape hatch**:
-  because there's no overlay there's no Esc, so the "3 Esc-rescues in 10 minutes
-  auto-pauses monitoring" failsafe can't intervene. If recognition starts
-  misjudging you (bad enrollment, bad lighting), it will keep locking you out
-  with no in-app way to stop it short of quitting from the menu bar. Pair it
-  with a verified enrollment.
+  either way: only your face, or Esc ×3 followed by Touch ID.
+- **Never Countdown** = no countdown and no overlay at all; the screen locks the
+  moment presence lapses. Strictest setting. With no overlay there is also no Esc
+  gesture, so if recognition starts misjudging you it would lock you out
+  repeatedly — a single lock is harmless, but a loop is a trap. A fallback covers
+  that: after two locks with no successful match in between, a minimum 3 s
+  countdown is restored regardless of this setting, purely so the escape gesture
+  exists again. Any real match clears it and instant locking resumes.
 
 ### Idle When Typing For (10/20/30 s / Never Idle, default 10)
 
@@ -194,9 +198,6 @@ Sustained keyboard/mouse use required before the camera goes to sleep
 - **Never Idle** = the camera always watches (steady ~8–9% CPU) and the
   wake option below is disabled. Maximum vigilance: no blind window at all;
   choose this in hostile environments.
-
-Unavailable when Start Countdown After is 1 s, in which case both this and the
-wake option below are greyed out with the reason shown.
 
 ### Wake From Idle After (1/2/3/5 s, default 2)
 
@@ -212,16 +213,30 @@ The typing pause that wakes an idle camera.
   match restores presence), so post-pause lockout is
   ~wake + grace + countdown regardless of this value.
 
-### Active Hours (default 9:00 AM–8:00 PM, or "Always on")
+### Active Hours & Days (default 9:00 AM–8:00 PM, Mon–Fri)
 
-Panel with an "Always on" checkbox and hour:minute pickers; edits apply on
-**Save**, **Cancel** discards. Auto-starts monitoring at the start boundary,
-auto-pauses at the end ("Paused (off hours)"). Boundary crossings force the
-state; in between, manual Start/Pause wins: pausing at 10:00 stays paused
-until tomorrow 09:00, manually starting at 22:00 runs until the next end
-boundary. Overnight ranges (e.g. 21:00–06:00) work. A boundary never unlocks
-a locked screen. **Off hours = zero resource use and zero protection**: the
-schedule is a convenience, not a security feature.
+Monitoring around the clock is what **"Always on"** is for; equal start and end
+times are rejected rather than silently meaning 24 hours.
+
+One panel (menu bar → Settings → Active Hours…) with an "Always on" checkbox,
+hour:minute pickers, weekday checkboxes and an "All days" toggle. Edits apply on
+**Save**; **Cancel** discards. Monitoring auto-starts at the start boundary and
+auto-pauses at the end, and the status line says which reason applies —
+"Paused (off hours)" or "Paused (Sat not active)".
+
+Hours and days are one model rather than two filters: each selected weekday opens
+a single window at the start time, lasting the configured span. So overnight
+ranges work (21:00–06:00), and such a window belongs to the day it **opened** on
+— a Friday 21:00–06:00 shift stays active into Saturday morning even when
+Saturday isn't selected, which is what an overnight range means.
+
+At least one day must stay selected; an empty set would mean monitoring never
+runs, which reads as configured protection but provides none. Boundary crossings
+force the state, and in between manual Start/Pause wins: pausing at 10:00 stays
+paused until the next boundary, manually starting at 22:00 runs until the next
+end boundary. A boundary never unlocks a locked screen. **Off hours, or an
+inactive day, means zero resource use and zero protection** — the schedule is a
+convenience, not a security feature.
 
 ### Open at Login (default on)
 
@@ -283,8 +298,9 @@ AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
   triggers a countdown even if theirs gets flagged a mismatch the same
   frame.
 - **The countdown is the identity gate**: once presence lapses past the
-  grace period, only a fresh positive match (or Esc) cancels it; an
-  unmatched face alone can't keep the screen open. The overlay is
+  grace period, only a fresh positive match cancels it outright; an unmatched
+  face alone can't keep the screen open, and Esc requires authentication (see
+  Security).  The overlay is
   deliberately discreet, a passerby sees a sleeping display, not a "this Mac
   is unlocked" billboard; you get a soft chime as the cue.
 - **Camera idle while typing**: sustained keyboard/mouse use puts the
@@ -293,6 +309,10 @@ AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
   chain must be re-established by a fresh match before face or body alone
   can maintain it again. Never idles before a positive match, during
   countdown/enrollment, or when the grace period is under 3 s.
+- **Deadlines are monotonic**: the countdown and the lock are armed off a
+  monotonic clock, so a system clock change can't fire either early. Active
+  Hours & Days deliberately stays on wall-clock time — if the date changes, the
+  schedule should move with it.
 - **Lock is verified, not assumed**: a few seconds after firing the lock,
   the app confirms the session actually locked. A silent failure (e.g. the
   private API disappearing in an OS update) pauses monitoring and alerts
@@ -342,8 +362,8 @@ countdown 3 s, wake 2 s):
 | You leave; empty seat | ~6 s (grace + countdown) |
 | Stranger takes the seat and faces the screen | ~6 s, same as an empty seat — a face already confirmed as not you doesn't buy it any extra time |
 | Stranger takes over during camera idle, then pauses typing ≥ wake threshold | ~8 s after the pause (wake gate: only a match restores presence) |
-| Stranger takes over during camera idle and **never pauses input** past the wake threshold | **Unbounded** (the camera never wakes). Mitigate: lower Wake From Idle After, or Never Idle. |
-| Stranger in the seat who **never faces the screen** (head down, turned away) while the camera watches | **Unbounded**: the body-detection fallback has no identity check at all (only the face path does), so a torso in frame alone still maintains presence indefinitely. In practice people glance at screens constantly, which immediately re-triggers the (now-instant) face mismatch. |
+| Stranger takes over during camera idle and **never pauses input** past the wake threshold | **Unbounded, and accepted deliberately.** The camera is stopped while resting, and holding a key keeps input flowing — which is exactly what keeps it asleep, so the attacker's own activity sustains the blindness. A forced-wake ceiling was built and measured, then left off: it costs a ~10–18% camera duty cycle forever. **The answer is Never Idle**, which removes the window entirely. See [docs/TESTING.md](docs/TESTING.md) entry 2. |
+| Stranger in the seat who **never faces the screen** (head down, turned away) while the camera watches | No time cap: body detection has no identity check (only the face path does), so a torso in frame maintains presence indefinitely. **Accepted deliberately** — an intruder has to look at the screen to do anything with the machine, and the moment they do the frontal check breaks the chain within ~3 frames. Capping it would instead lock out an owner turned toward a second monitor. |
 
 Structural risks, independent of settings:
 
@@ -351,11 +371,18 @@ Structural risks, independent of settings:
   photo of you can cancel a countdown or re-establish presence. This is
   presence/discipline tooling, not authentication; unlocking still requires
   your password/Touch ID.
-- **Esc cancels the countdown** and is not identity-checked (it's the
-  failsafe against a bad enrollment locking you out). Anyone who knows it
-  can cancel countdowns, but 3 Esc-rescues in 10 minutes auto-pauses
-  monitoring *visibly* (alert + pause icon), so it can't be exploited
-  silently forever.
+- **Esc does not cancel a countdown on its own.** A single unchecked keypress
+  that dismisses a lock is the bypass an intruder would reach for, so it takes
+  **three presses on the same overlay**, which then asks the Mac to verify who is
+  pressing. The gesture is revealed only after the first press, so a passerby
+  sees a blank screen. The lock is held while the prompt is up; dismissing or
+  failing it restores the countdown exactly where it was, so an intruder gains
+  nothing and the screen still locks. Passing it pauses monitoring, which then
+  **will not resume automatically** — not on a schedule boundary, an unlock, or a
+  display wake — until you re-enroll; your existing profile keeps working until
+  the new one is saved. Residual: if the Mac has no authentication policy
+  available (no account password), the gesture can't complete, and the way out is
+  Pause from the menu bar after logging back in.
 - **Presence-only fallback**: with no enrolled profile, *any* face counts
   as you. The warning icon and red menu item exist precisely because this
   mode offers no identity protection; enroll immediately.
@@ -446,7 +473,9 @@ own [MIT License](LICENSE) covers only its own Swift source.
 ## Contributing
 
 Bug reports and focused PRs are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md)
-for the development setup, testing approach, and code style.
+for the development setup, testing approach, and code style, and
+[docs/TESTING.md](docs/TESTING.md) for the manual checklist and the watch list of
+deliberately-accepted risks.
 
 ## Changelog
 

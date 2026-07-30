@@ -8,6 +8,9 @@ import Foundation
 final class EnrollmentController {
     /// Enrollment is over (saved, failed-and-cancelled, or window closed).
     var onFinished: (() -> Void)?
+    /// Fired only when a new profile was actually saved — distinct from
+    /// `onFinished`, which also fires on cancel.
+    var onProfileCommitted: (() -> Void)?
 
     private let recognizer: FaceRecognizer
     private let monitor: FaceMonitor
@@ -116,6 +119,7 @@ final class EnrollmentController {
             guard let candidateProfile else { return }
             do {
                 try recognizer.commit(candidateProfile)
+                onProfileCommitted?()
                 finish()
             } catch {
                 showFailure("Could not save the profile: \(error.localizedDescription)")

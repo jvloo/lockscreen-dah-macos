@@ -20,7 +20,7 @@ struct DetectionResult {
     /// presence clock must be stamped with this rather than "now on the main
     /// thread": Vision + up to 4 Core ML embeddings + a main-thread hop sit in
     /// between, and counting that latency as absence made the countdown late.
-    var capturedAt: Date
+    var capturedAt: TimeInterval
 }
 
 /// Low-footprint webcam face watcher: 640x480 capture capped at ~3 fps at the
@@ -36,7 +36,9 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private let output = AVCaptureVideoDataOutput()
     private let queue = DispatchQueue(label: "com.xavierloo.lockscreen-dah.camera", qos: .utility)
     private var configured = false
-    private var lastAnalysis = Date.distantPast
+    // -infinity rather than 0: uptime starts near 0 at boot, and this must
+    // mean "never analyzed" so the first frame is always taken.
+    private var lastAnalysis = -Double.infinity
 
     // Everything the main thread and the camera queue share, guarded by a lock
     // rather than `queue.sync`: the camera queue runs Vision + Core ML, so a
@@ -44,7 +46,7 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     // exactly the kind of stall that would blow the countdown's timing.
     private let stateLock = NSLock()
     private var framesSinceStart = 0
-    private var firstFrame: Date?
+    private var firstFrame: TimeInterval?
     private var interval: TimeInterval = 1.5
     private var enrollmentMode = false
 
@@ -172,7 +174,7 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// The grace clock is anchored no earlier than this: a session that only
     /// just opened has had no opportunity to see anyone, so counting absence
     /// from before it would black out a seated user.
-    var firstFrameAt: Date? {
+    var firstFrameAt: TimeInterval? {
         stateLock.lock()
         defer { stateLock.unlock() }
         return firstFrame
@@ -228,7 +230,7 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        let now = Date()
+        let now = Uptime.now
         // Counted before the analysis throttle: delivery alone proves the
         // capture pipeline is alive, whether or not this frame gets analyzed.
         stateLock.lock()
@@ -238,7 +240,7 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         let enrollmentMode = self.enrollmentMode
         stateLock.unlock()
 
-        guard now.timeIntervalSince(lastAnalysis) >= interval else { return }
+        guard now - lastAnalysis >= interval else { return }
         lastAnalysis = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
