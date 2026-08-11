@@ -30,8 +30,8 @@ coverage for the logic all of that touches.
   21:00–06:00 shift stays active into Saturday morning even when Saturday isn't
   selected. Adjacent windows are merged, so a fully continuous schedule (every
   day, 24 hours) still exposes no boundary and a manual pause survives it.
-- A test target (`swift test`, 51 tests) covering `PresenceTracker` and
-  `Settings` — the two pure value types where every presence and timing bug in
+- A test target (`swift test`, 76 tests) covering `PresenceTracker`,
+  `Settings`, `MonitoringSchedule` and `CameraRestPolicy` — the two pure value types where every presence and timing bug in
   this project has actually lived. It pins down seat continuity, the stranger
   streak, the identity gates, the duration clamps, and schedule/day resolution
   including overnight ranges. Verified by reintroducing two of the fixed bugs
@@ -90,6 +90,18 @@ coverage for the logic all of that touches.
   automatically** — not on a schedule boundary, an unlock, or a display wake —
   until you re-enroll. The requirement is persisted, so quitting can't clear it,
   and your existing profile keeps working until the new one is saved.
+- Broke the fat controller apart. `AppDelegate` went from 456 lines to 15 — menu
+  construction, the custom menu row and login-item reconciliation now live in
+  `StatusMenuController`, `StayOpenOptionView` and `LoginItem`. Schedule
+  resolution left `Settings` for `MonitoringSchedule`, which takes its calendar as
+  a parameter, so DST transitions, time zones and first-day-of-week behaviour are
+  testable for the first time rather than being asserted against whatever machine
+  happened to run the suite. The camera rest/wake decision became
+  `CameraRestPolicy`, a pure function — its edges are security edges, since they
+  decide when the app is deliberately blind, and were previously reachable only by
+  typing at a laptop and watching. Both deadline timers share one `DeadlineTimer`,
+  so the monotonic conversion the whole clock fix rests on exists once.
+  `MonitorCoordinator` is still large; the decision-layer extraction is next.
 - Added [docs/TESTING.md](docs/TESTING.md): a manual checklist for everything
   tests can't reach, plus a watch list of deliberately-accepted risks with what
   to look for in each.
@@ -102,6 +114,23 @@ coverage for the logic all of that touches.
   with it.
 
 ### Fixed
+
+
+- **A camera that failed to start disabled protection for the rest of the day.**
+  The failure path called `pause()`, which stamps the "last decision" timestamp —
+  the mechanism that deliberately makes a *user's* pause survive sleep and lock
+  until the next schedule boundary. Applied to a hardware stumble that meant a
+  one-second hiccup left the screen unwatched for hours, with only a dismissible
+  modal as evidence. Found while troubleshooting a real occurrence.
+
+  A failure now enters a new `cameraUnavailable` state and retries after 30 s,
+  60 s and 300 s without consuming a schedule decision; any delivered frame
+  resets the count, and only after all three retries does it become a real
+  paused-with-alert. The state is deliberately its own case rather than a flag:
+  it must not read as `watching` (claiming protection it isn't providing) nor as
+  `paused` (which means the user chose it). The menu-bar icon shows a
+  struck-through camera and the status line reads "Camera unavailable —
+  retrying".
 
 - **Ticking "Always on" left monitoring off while the UI said it was on.** The
   schedule panel writes `scheduleEnabled` before notifying the coordinator, and

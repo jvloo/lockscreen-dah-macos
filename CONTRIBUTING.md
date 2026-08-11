@@ -39,12 +39,17 @@ with Hardened Runtime. See `Package.swift` and `build.sh`.
 swift test
 ```
 
-`PresenceTracker` and `Settings` are pure value types with no AppKit or camera
-dependency, and they're where every presence and timing bug in this project has
-actually lived — so they're covered directly. If you change the presence chain,
-the duration clamps, or the Active Hours boundary maths, **add or update a test
-there**; several past bugs were the fix for an earlier bug, which is exactly
-what these catch.
+`PresenceTracker`, `Settings`, `MonitoringSchedule` and `CameraRestPolicy` are
+pure types with no AppKit or camera dependency, and they're where every presence
+and timing bug in this project has actually lived — so they're covered directly.
+If you change the presence chain, the duration clamps, the schedule maths or the
+camera rest/wake rules, **add or update a test there**; several past bugs were
+the fix for an earlier bug, which is exactly what these catch.
+
+New logic belongs in a pure type wherever it can. `MonitoringSchedule` takes its
+`Calendar` as a parameter and `CameraRestPolicy` takes a plain input struct
+precisely so their edge cases are reachable without a camera, a run loop, or the
+tester's own settings.
 
 `Settings` tests must run against a scratch `UserDefaults` suite, never the real
 app domain (see `SettingsTests.setUp`) — otherwise they'd clobber the tester's

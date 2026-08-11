@@ -83,11 +83,9 @@ enum Settings {
 
     // MARK: - Monitoring schedule (follows system time)
     //
-    // Hours and days are resolved through one model: each active weekday opens
-    // exactly one window at `scheduleStartMinutes` lasting `windowMinutes`.
-    // That makes overnight ranges fall out for free (the window simply spills
-    // past midnight) and it means "am I within hours" and "when did the
-    // schedule last change" can't disagree, because both read the same windows.
+    // Persistence and validation only. The resolution of hours + days into
+    // windows lives in `MonitoringSchedule`, which takes its calendar as a
+    // parameter and so can be tested across time zones and DST.
 
     /// When enabled, monitoring auto-starts/pauses on the configured schedule;
     /// when disabled, monitoring is always on unless the user pauses it.
@@ -112,21 +110,17 @@ enum Settings {
         set { defaults.set(clampMinutes(newValue), forKey: "scheduleEndMinutes") }
     }
 
-    /// Weekdays monitoring runs on, in `Calendar` numbering (1 = Sunday through
-    /// 7 = Saturday). Defaults to Mon–Fri.
-    static let defaultActiveDays: Set<Int> = [2, 3, 4, 5, 6]
-
     /// Days the schedule is active on. A stored value that is empty or entirely
     /// invalid falls back to the default rather than being honoured: "no active
-    /// days" would mean monitoring never runs, which no UI can produce and
-    /// which would silently leave the screen unprotected forever.
+    /// days" would mean monitoring never runs, which reads as configured
+    /// protection but provides none.
     static var activeDays: Set<Int> {
         get {
             guard let stored = defaults.array(forKey: "activeDays") as? [Int] else {
-                return defaultActiveDays
+                return ScheduleConfig.defaultActiveDays
             }
             let valid = Set(stored.filter { (1...7).contains($0) })
-            return valid.isEmpty ? defaultActiveDays : valid
+            return valid.isEmpty ? ScheduleConfig.defaultActiveDays : valid
         }
         set {
             let valid = newValue.filter { (1...7).contains($0) }
@@ -135,97 +129,18 @@ enum Settings {
         }
     }
 
-    /// Length of one window. Start == end is rejected by the settings panel
-    /// (it has no single sensible reading — 24 hours, or zero?), so treating it
-    /// as a full day here is only a fallback for a tampered defaults value.
-    private static var windowMinutes: Int {
-        let span = (scheduleEndMinutes - scheduleStartMinutes + 1440) % 1440
-        return span == 0 ? 1440 : span
+    static var scheduleConfig: ScheduleConfig {
+        ScheduleConfig(
+            isEnabled: scheduleEnabled,
+            startMinutes: scheduleStartMinutes,
+            endMinutes: scheduleEndMinutes,
+            activeDays: activeDays
+        )
     }
 
-    /// True when the schedule never actually changes state: every day selected
-    /// and a full-day window. Such a schedule has no boundaries, so a manual
-    /// pause must survive indefinitely — same as having the schedule off.
-    static var isContinuous: Bool { windowMinutes == 1440 && activeDays.count == 7 }
-
-    /// Monitoring windows near `now`, merged so a contiguous stretch exposes no
-    /// interior edge. Merging matters: without it, every-day-selected with a
-    /// 24-hour range would show a spurious "boundary" at each midnight and
-    /// override a manual pause at a moment when nothing actually changed.
-    ///
-    /// A window is governed by the day it *opened* on, so a Friday 21:00–06:00
-    /// shift stays active into Saturday morning even when Saturday isn't
-    /// selected — which is what anyone setting an overnight range means.
-    private static func scheduleWindows(around now: Date) -> [(open: Date, close: Date)] {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: now)
-        let days = activeDays
-        let duration = TimeInterval(windowMinutes) * 60
-
-        var raw: [(open: Date, close: Date)] = []
-        // Two days ahead and eight back covers "the window that opened
-        // yesterday and is still running" plus enough history for the boundary
-        // lookup after a multi-day sleep.
-        for offset in -8...1 {
-            guard let day = calendar.date(byAdding: .day, value: offset, to: today),
-                  days.contains(calendar.component(.weekday, from: day)),
-                  let open = calendar.date(
-                      bySettingHour: scheduleStartMinutes / 60,
-                      minute: scheduleStartMinutes % 60,
-                      second: 0,
-                      of: day
-                  )
-            else { continue }
-            raw.append((open, open.addingTimeInterval(duration)))
-        }
-
-        return raw.sorted { $0.open < $1.open }.reduce(into: []) { merged, window in
-            if let last = merged.last, window.open <= last.close {
-                merged[merged.count - 1].close = max(last.close, window.close)
-            } else {
-                merged.append(window)
-            }
-        }
-    }
-
-    /// True when monitoring should be active right now. Always true when the
-    /// schedule is disabled.
-    static func withinMonitoringHours(now: Date = Date()) -> Bool {
-        guard scheduleEnabled else { return true }
-        return scheduleWindows(around: now).contains { now >= $0.open && now < $0.close }
-    }
-
-    /// The most recent instant the schedule changed state, at or before `now`.
-    /// Returns `.distantPast` when there is no meaningful boundary — schedule
-    /// disabled, or continuous — so a caller comparing a decision timestamp
-    /// against this never sees it as stale.
-    static func mostRecentBoundary(before now: Date = Date()) -> Date {
-        guard scheduleEnabled, !isContinuous else { return .distantPast }
-        return scheduleWindows(around: now)
-            .flatMap { [$0.open, $0.close] }
-            .filter { $0 <= now }
-            .max() ?? .distantPast
-    }
-
-    /// Weekday order for display and for the panel's checkboxes: work weeks
-    /// read Monday-first, whereas Calendar numbers Sunday as 1.
-    static let weekdayDisplayOrder = [2, 3, 4, 5, 6, 7, 1]
-
-    static func weekdayName(_ weekday: Int) -> String {
-        let symbols = Calendar.current.shortWeekdaySymbols // index 0 == Sunday
-        guard (1...7).contains(weekday) else { return "?" }
-        return symbols[weekday - 1]
-    }
-
-    /// Compact description for the menu: "All days", "Mon–Fri", "Weekends", or
-    /// a comma list.
-    static func formatActiveDays() -> String {
-        let days = activeDays
-        if days.count == 7 { return "All days" }
-        if days == defaultActiveDays { return "Mon–Fri" }
-        if days == [1, 7] { return "Weekends" }
-        return weekdayDisplayOrder.filter(days.contains).map(weekdayName).joined(separator: ", ")
-    }
+    /// The live schedule. Cheap to build, so callers read it fresh rather than
+    /// caching a copy that could drift from the stored settings.
+    static var schedule: MonitoringSchedule { MonitoringSchedule(scheduleConfig) }
 
     /// Locks fired with no successful face match in between. Persisted on
     /// purpose: every iteration of a lock loop passes through a screen lock, and

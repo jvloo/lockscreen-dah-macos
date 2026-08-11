@@ -69,9 +69,9 @@ final class ActiveHoursPanel: NSObject {
         // Monday-first, which is how a work week reads — Calendar numbers
         // Sunday as 1, so display order is explicit rather than 1...7.
         var dayButtons: [NSView] = []
-        for weekday in Settings.weekdayDisplayOrder {
+        for weekday in Weekday.displayOrder {
             let box = NSButton(
-                checkboxWithTitle: Settings.weekdayName(weekday),
+                checkboxWithTitle: Weekday.name(weekday),
                 target: self,
                 action: #selector(toggleDay)
             )
@@ -175,7 +175,7 @@ final class ActiveHoursPanel: NSObject {
         let all = allDaysCheckbox?.state == .on
         // Unticking "All days" would otherwise leave every day selected and the
         // checkbox contradicting them, so fall back to the default work week.
-        let target = all ? Set(1...7) : Settings.defaultActiveDays
+        let target = all ? Set(1...7) : ScheduleConfig.defaultActiveDays
         for (weekday, box) in dayCheckboxes {
             box.state = target.contains(weekday) ? .on : .off
         }

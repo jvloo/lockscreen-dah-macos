@@ -1,7 +1,8 @@
 # Testing & watch list
 
-`swift test` covers `PresenceTracker` and `Settings` — the pure logic where every
-presence and timing bug in this project has actually lived. Everything below is
+`swift test` covers `PresenceTracker`, `Settings`, `MonitoringSchedule` and
+`CameraRestPolicy` — the pure logic where every presence and timing bug in this
+project has actually lived. Everything below is
 what a test **can't** reach: it needs a real camera, a real face, and in a couple
 of cases a second person.
 
@@ -99,7 +100,30 @@ would reset before it could notice.
 and instant, then a short countdown to start appearing. Any successful match
 clears the counter and instant locking resumes.
 
-### 5. Main-thread stalls delay the lock
+### 5. A camera failure recovers on its own
+
+**Status:** fixed. **Added:** after a real incident — the app sat unprotected for
+hours and reported "Camera failed to start".
+
+A camera that fails to deliver frames used to call `pause()`, which stamps
+`lastDecisionAt`. That stamp is what makes a *deliberate* pause survive sleep and
+lock until the next schedule boundary — correct for a user's choice, badly wrong
+for a hardware stumble. A one-second hiccup at 09:05 therefore disabled
+protection until 20:00, with only a dismissible modal as evidence.
+
+Now a failure enters `.cameraUnavailable` and retries after 30 s, 60 s, then
+300 s, without consuming a schedule decision. Any delivered frame resets the
+count. Only after all three retries fail does it become a real pause with an
+alert. The menu-bar icon shows a struck-through camera throughout and the status
+line reads "Camera unavailable — retrying", so it can never be mistaken for an
+ordinary pause.
+
+**What to look for:** open Photo Booth (taking the camera), then Start
+Monitoring. Expect the struck-through icon and a retry roughly 30 s later, not an
+immediate permanent pause. Quit Photo Booth and monitoring should resume by
+itself within a couple of minutes.
+
+### 6. Main-thread stalls delay the lock
 
 **Status:** inherent, measured.
 
@@ -117,7 +141,7 @@ applications and system hitches.
 **What to look for:** a lock landing visibly later than the countdown reached
 zero, correlating with the machine being busy.
 
-### 6. Photo or video spoofing
+### 7. Photo or video spoofing
 
 **Status:** cannot be fixed on this hardware. There is no liveness signal
 available from an RGB webcam without depth. A photo of the owner can cancel a
@@ -184,7 +208,11 @@ or the schedule. `./build.sh --install` first.
 ### Camera health
 
 - [ ] Hold the camera open in another app (Photo Booth), then Start Monitoring:
-      "Camera failed to start" and monitoring pauses — it must not lock.
+      icon becomes a struck-through camera, status reads "Camera unavailable —
+      retrying", and it must not lock. Quit Photo Booth: monitoring resumes on
+      its own within ~30 s, with no click needed.
+- [ ] Leave Photo Booth holding the camera through all three retries (~6.5 min):
+      only then does it become a real "Camera failed to start" pause.
 - [ ] Start, Pause, Start again within 3 s: **no** spurious camera-failure alert.
 - [ ] External camera: unplug it mid-session, replug, Start again — recovers
       without relaunching.

@@ -37,6 +37,15 @@ echo "Built $APP"
 
 if [ "${1:-}" = "--install" ]; then
   pkill -x "$EXECUTABLE" 2>/dev/null || true
+  # Wait for the old process to actually exit before relaunching. Reinstalling
+  # in a tight loop used to relaunch within milliseconds, while the dying
+  # instance still held the capture device — so the new one got no frames inside
+  # its startup allowance and reported "Camera failed to start".
+  for _ in $(seq 1 30); do
+    pgrep -x "$EXECUTABLE" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  sleep 0.5  # give the camera daemon a moment to release the device
   rm -rf "/Applications/$BUNDLE_NAME.app" "/Applications/Lockscreen Dah?.app" "/Applications/LockscreenDah.app"
   cp -R "$APP" "/Applications/$BUNDLE_NAME.app"
   echo "Installed /Applications/$BUNDLE_NAME.app"
