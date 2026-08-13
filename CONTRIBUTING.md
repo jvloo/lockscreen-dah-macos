@@ -39,17 +39,14 @@ with Hardened Runtime. See `Package.swift` and `build.sh`.
 swift test
 ```
 
-`PresenceTracker`, `Settings`, `MonitoringSchedule` and `CameraRestPolicy` are
-pure types with no AppKit or camera dependency, and they're where every presence
-and timing bug in this project has actually lived — so they're covered directly.
-If you change the presence chain, the duration clamps, the schedule maths or the
-camera rest/wake rules, **add or update a test there**; several past bugs were
+`PresenceTracker`, `Settings`, `MonitoringSchedule` and `EnrollmentStages` are pure types with no AppKit or camera dependency, and they're where every presence,
+timing and enrollment bug in this project has actually lived — so they're covered directly.
+If you change the presence chain, the duration clamps, the schedule maths, or an enrollment pose gate, **add or update a test there**; several past bugs were
 the fix for an earlier bug, which is exactly what these catch.
 
 New logic belongs in a pure type wherever it can. `MonitoringSchedule` takes its
-`Calendar` as a parameter and `CameraRestPolicy` takes a plain input struct
-precisely so their edge cases are reachable without a camera, a run loop, or the
-tester's own settings.
+`Calendar` as a parameter precisely so its edge cases are reachable without a
+camera, a run loop, or the tester's own settings.
 
 `Settings` tests must run against a scratch `UserDefaults` suite, never the real
 app domain (see `SettingsTests.setUp`) — otherwise they'd clobber the tester's
@@ -69,7 +66,10 @@ so verify those by running it:
   timers, and anything that moves a deadline must also reschedule its timer.
 - For recognition/enrollment changes, re-enroll and confirm both a positive
   match (your face) and a negative one (someone else, or a photo) behave as
-  expected.
+  expected. Every pose gate is a threshold on real Vision output, and reasoning
+  about what those values *should* be has produced a wrong one every time — read
+  `~/Library/Logs/LockscreenDah/enrollment-poses.log`, which records the measured
+  angle and verdict per frame, before changing a constant.
 
 ## Code style
 

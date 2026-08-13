@@ -5,7 +5,157 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.0] - 2026-08-13
+
+### Added
+
+- **A fourth enrollment pose: looking down at the keyboard.** The posture asked
+  about most, and the one the profile had no template for — which is what let
+  the owner's own face score as unrecognised while typing.
+- **Pose diagnostics.** Enrollment appends the head angles it measures, and
+  whether each was accepted, to `~/Library/Logs/LockscreenDah/enrollment-poses.log`
+  (angles only — no image data). Every enrollment bug so far has been a wrong
+  number in a pose gate, diagnosed by guessing at what Vision reports instead of
+  reading it. Appends rather than truncates: it originally reset on `begin()`,
+  and Re-Enroll calls `begin()`, so retrying a failed enrollment erased the
+  record of the failure.
+- `EnrollmentStages`, a pure type holding the pose gates, with tests. The gates
+  had no coverage precisely because they lived inside a controller that needs a
+  camera.
+
+### Removed
+
+- **"Idle when typing" is gone.** It stopped the capture session during
+  sustained typing and let keystrokes stand in for a verified face — and an
+  intruder's own typing was what *kept* the camera asleep, so the blind window
+  was unbounded and attacker-controlled. That is the one thing this app exists
+  to prevent, so it is removed rather than defaulted off: a setting that
+  silently disables the core guarantee shouldn't be one click away.
+
+  Measured before deciding: the capture pipeline alone costs ~5.5% of one core
+  (Vision and Core ML add ~3% on top), so the feature did save something real —
+  not the negligible amount first assumed. It was removed knowing that price.
+
+  Gone with it: `cameraRestAfter`, `cameraWakeQuiet` and their menu rows, the
+  rest/wake/peek machinery, `cameraMinAwake`, `cameraRestMinimumGrace`,
+  `CameraRestPolicy`, the "Idle while typing" status and 💤 icon, and two
+  watch-list entries. Stored values for the removed settings are simply ignored.
+
+### Fixed
+
+- **The countdown overlay could flash on and off while you were sitting there.**
+  Removing camera idling exposed it: sustained typing used to put the camera to
+  sleep and let keystrokes carry presence, so recognition was never consulted and
+  a marginal profile could never produce a blackout. With the camera watching
+  continuously it is consulted every second, including while you look down at the
+  keyboard.
+
+  The underlying fault was that a continuous similarity score was collapsed into
+  two booleans at a single threshold, so a face scoring just under the match bar
+  was reported identically to one scoring near zero — and a single such frame
+  withheld seat continuity. Four in a row put a blackout on screen. An ambiguous
+  band between "confidently you" and "confidently not you" is restored, and
+  ambiguity now sustains presence exactly as a turned head does.
+
+  That band was removed in v1.1.2 for a real reason — a stranger scoring inside
+  it could hold the screen open indefinitely — but the fault was in the
+  *continuity* rule, which counted any face regardless of identity. Continuity
+  now ignores a flagged face, so the fault is fixed at its source; collapsing the
+  band only ever cost the owner false countdowns.
+
+- **An ambiguous face can no longer hold the screen open indefinitely.**
+  Restoring the ambiguous band left a gap: a stranger scoring between the two
+  thresholds sustained presence forever, because seat continuity has no time
+  cap — by design, so that working turned toward a second screen never nags.
+
+  Closed by separating "the model couldn't see well enough to judge" from "the
+  model looked and wasn't sure". A face is now judged only when near-frontal on
+  **both** yaw and pitch; yaw alone treated a head tipped down at the keyboard as
+  frontal, judged it, and accused the owner. A judgeable face that fails to
+  confirm starts a 5 s clock, after which it stops sustaining presence.
+  Turned-away faces and torsos are never put on that clock, so the second-screen
+  case is untouched. Confidence sets the speed: certain mismatch ends the chain
+  in three frames, uncertainty gets five seconds to resolve.
+
+### Changed
+
+- **Match threshold raised from 0.35 to 0.45.** With turned and head-down poses
+  enrolled, a held-out live frame scores ~0.96 against the profile, so the old
+  bar sat far below anything the owner produces and gave that much more room to
+  a look-alike. Raising it moves a partial match from "accepted outright" into
+  the bounded ambiguous band. Not raised further: head-down is both the weakest
+  scoring pose and the one held longest while typing, so it sets the real floor.
+
+- **Enrollment's self-check is scored leave-one-out.** Each sample was measured
+  against a profile built from those same samples — the template partly *is* the
+  sample — so the reported score flattered itself. Since that number is what a
+  decision to tighten the threshold rests on, the bias read as headroom that did
+  not exist. Each sample is now scored against templates rebuilt from the other
+  fifteen.
+
+- **Camera liveness is now supervised continuously instead of checked once.**
+  The old design verified the session 3 s after start and then assumed it healthy
+  forever — the "has delivered a frame" flag was sticky, so a session that died
+  later was invisible. `FaceMonitor` now records the instant of every frame and
+  the 1 Hz tick asserts the gap stays under 3 s. Frames arrive at the sensor's
+  rate regardless of the analysis throttle, so a gap is unambiguous, and one rule
+  covers both "never came up" and "died later". `verifyCameraStarted`,
+  `hasDeliveredFrame` and `framesSinceStart` are gone with it.
+- **Camera retries no longer give up.** The previous ladder stopped after three
+  attempts (~6.5 min) and paused permanently, so a camera held longer than that
+  by another app cost protection for the rest of the day. Backoff now holds at
+  5 minutes and repeats indefinitely; the user is told once, and the struck-through
+  icon and status line carry it after that.
+- **A dead camera no longer locks you repeatedly.** On a stale camera the app now
+  asks whether absence was *already proven* before it went blind. If the grace
+  period had elapsed while it could still see, that is real evidence and it locks
+  — once. Otherwise it holds the screen and retries. Locking because our own
+  camera broke punishes the user for our fault.
+- **"Start Countdown After" now defaults to 1 s** (was 3 s). A security tool
+  shouldn't ship a weaker default than the one it recommends, and the cost is
+  CPU rather than reliability: the analysis cadence scales with the setting
+  (`delay/4`), so roughly four detection attempts fit inside the window at any
+  value. Measured difference is about 2% of one core. Existing installs keep
+  whatever they have set.
+
+### Fixed
+
+- The sensor frame-rate cap never worked, and the docs stated its result as
+  fact. The code asks for 3 fps, but every format on the test machine's built-in
+  camera reports a 15 fps floor, so `min(max(3, 15), 30)` resolved to 15 — and
+  the device then delivered ~27 fps regardless, including with the session preset
+  removed and the format chosen by hand. The request now targets the slowest rate
+  the device actually advertises, and both the code and the README say plainly
+  that it is a request the hardware may ignore. The README's sampling table was
+  recomputed against real delivery rather than the assumed 3 fps.
+- The menu offered three rows that all said "re-enrollment" while a re-enrollment
+  was owed, two of which ran the same action. The Start/Pause row is now omitted
+  in that state, leaving one row that names the outcome.
+
+- **Enrollment stalled at 50% of the second turn, asking the user to turn the
+  other way while they already were.** The stage was handed one flat list of
+  every sample collected so far — including the samples it had just accepted
+  itself — to work out which direction the previous turn went. Each capture
+  dragged that reference average toward zero, flipping its sign after two, at
+  which point the gate rejected the exact direction it had been accepting. Gates
+  now receive the samples of *completed* stages only, grouped by stage, so a
+  stage cannot see its own output; the failure is no longer expressible rather
+  than merely fixed.
+
+- **The turn stages depended on a yaw sign convention that was never verified.**
+  The preview is mirrored so it behaves like a mirror, while Vision measures the
+  unmirrored buffer — so "left" on screen and the sign of yaw need not agree, and
+  a genuine left turn was rejected by the stage asking for it. Neither turn stage
+  depends on the sign now: whichever way the user turns first defines the pair,
+  and the second stage requires the opposite.
+
+- **Head tilt was judged against zero rather than the user's resting pose.** A
+  laptop camera sits above the screen and reads ~0.2 rad of pitch on someone
+  sitting normally, so an absolute gate measured desk geometry as much as head
+  movement — and the straight-ahead stage could reject people for sitting low.
+  The resting pitch captured in the first stage is now the baseline, stored in
+  the profile and used by live detection too, so enrollment and detection agree
+  on what level means.
 
 ## [1.3.0] - 2026-07-29
 
@@ -30,9 +180,9 @@ coverage for the logic all of that touches.
   21:00–06:00 shift stays active into Saturday morning even when Saturday isn't
   selected. Adjacent windows are merged, so a fully continuous schedule (every
   day, 24 hours) still exposes no boundary and a manual pause survives it.
-- A test target (`swift test`, 76 tests) covering `PresenceTracker`,
-  `Settings`, `MonitoringSchedule` and `CameraRestPolicy` — the two pure value types where every presence and timing bug in
-  this project has actually lived. It pins down seat continuity, the stranger
+- A test target (`swift test`, 76 tests) covering `PresenceTracker`, `Settings`,
+  `MonitoringSchedule` and `CameraRestPolicy` — the pure types where every
+  presence and timing bug in this project has actually lived. It pins down seat continuity, the stranger
   streak, the identity gates, the duration clamps, and schedule/day resolution
   including overnight ranges. Verified by reintroducing two of the fixed bugs
   and confirming the relevant tests fail. `Settings` tests run against a scratch

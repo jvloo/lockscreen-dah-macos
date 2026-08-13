@@ -1,8 +1,8 @@
 # Testing & watch list
 
 `swift test` covers `PresenceTracker`, `Settings`, `MonitoringSchedule` and
-`CameraRestPolicy` — the pure logic where every presence and timing bug in this
-project has actually lived. Everything below is
+`EnrollmentStages` — the pure logic where every presence, timing and enrollment
+bug in this project has actually lived. Everything below is
 what a test **can't** reach: it needs a real camera, a real face, and in a couple
 of cases a second person.
 
@@ -11,62 +11,42 @@ of cases a second person.
 Known-risk behaviours that are deliberately allowed rather than fixed. Each one
 says what to look for, so a report is "I saw X" rather than "it feels off".
 
-### 1. Overlay flash after a typing pause at a 1 s countdown delay
+### 0. The match threshold is set from a single enrollment session
 
-**Status:** allowed, on watch. **Introduced:** v1.3.0 (idling became available at
-every delay).
+**Status:** on watch. **Added:** when the threshold went 0.35 → 0.45.
 
-Camera idling stops the capture session outright. Waking is an identity gate, so
-you must land one fresh face match inside the countdown delay or the overlay
-appears. Session spin-up itself no longer counts against the delay — the clock
-starts at the first delivered frame — but auto-exposure is re-converging from
-cold, so the first frame or two can be unusable. At a 1 s delay that leaves
-roughly three attempts.
+0.45 is set against measured scores — a held-out live frame at ~0.96, the
+weakest enrolled pose at ~0.71 — but every one of those numbers was captured
+within minutes of enrolling: one lighting condition, one distance, one day. The
+threshold has never been checked against the variation of ordinary use.
 
-**What to look for:** a brief full-screen blackout, one to two seconds after you
-stop typing, that cancels itself once your face is recognised. With the forced
-wake disabled (entry 2), this can only happen on a genuine typing pause, and
-`cameraMinAwake` (20 s) bounds it to at most one occurrence per ~20–30 s.
+The binding pose is head-down-while-typing: it scores lowest *and* is held
+longest, and it is judgeable, so a sustained under-threshold score there breaks
+the presence chain after 5 s and starts a countdown.
 
-**If it happens:** raise Start Countdown After to 3 s, or set Idle When Typing
-For to **Never Idle**. If it happens often, `cameraRestMinimumGrace` in
-`Settings.swift` should go back to 3.
+**What to look for:** a countdown while you are sitting there typing with your
+head down. That is the signature of the threshold being too tight, and the fix
+is `matchThreshold` back to 0.35 — not another pose gate. Tightening further
+(0.55) needs the owner's live score distribution across a real day, which
+nothing currently records.
 
-### 2. Blind window while the camera is idling — UNBOUNDED
+### 1. Pitch tolerance is an informed guess, not a tuned value
 
-**Status:** accepted, unbounded. **Decided:** v1.3.0, after measuring the cost of
-the alternative.
+**Status:** on watch. **Added:** with the judgeable-face change.
 
-While resting, the camera is **stopped** and presence is asserted by keystrokes
-alone. The dangerous property is that an intruder's own activity *sustains* the
-blindness rather than ending it: holding a key keeps input flowing, which is
-exactly what keeps the camera asleep. Their face costs them nothing, because
-nothing is watching. This is why the "they have to look at the screen" reasoning
-that covers entry 3 does **not** cover this one.
+A face is only judged — matched against or accused — when it is near-frontal on
+**both** yaw and pitch (0.5 rad, ~30°). Yaw alone treated a head tipped down at
+the keyboard as frontal, judged it, and accused the owner's own face.
 
-**The concrete attack:**
+The pitch limit was reasoned about, not measured against real seating. Too tight
+and a stranger looking slightly down is never judged; too loose and the original
+false-accusation returns.
 
-1. You're typing; the chain is established; the camera rests.
-2. You walk away. An intruder holds a key within the wake threshold (1–5 s).
-3. `presence.touch()` keeps firing on input alone — the camera never reopens.
-4. They use the machine freely, facing the screen or not.
+**What to look for:** blackouts while you read the keyboard (too loose), or a
+colleague sitting frontally who never triggers a countdown (too tight). Both
+point at `maxStrangerPitch` in `FaceMonitor.swift`.
 
-**Why it isn't capped.** A 10 s ceiling with a 2 s "peek" was built and measured:
-it bounds the window, but it reopens the camera roughly every 10 s forever, giving
-a ~10–18% duty cycle against ~0% while resting, and re-running auto-exposure each
-time. That cost was judged not worth paying continuously for a threat that needs
-an attacker physically holding a key during a narrow handover. The machinery is
-still in the code — set `cameraRestMaxDuration` in `MonitorCoordinator.swift`
-above 0 to switch it back on.
-
-**The tradeoff, stated plainly:** camera idling trades an unbounded blind window
-for near-zero CPU. There is no middle setting that avoids both.
-
-**If your threat model doesn't accept that:** set Idle When Typing For to
-**Never Idle**. The camera then watches continuously — no blind window at all —
-at a steady ~8–9% of one core. That is the supported answer to this risk.
-
-### 3. Stranger who never faces the camera
+### 2. Stranger who never faces the camera
 
 **Status:** accepted. Rationale below.
 
@@ -77,11 +57,14 @@ cap, and the stranger challenge can't help because it only judges near-frontal
 faces.
 
 **Why this is accepted rather than capped:** an intruder has to *look at the
-screen* to do anything with the machine. The moment they do, the frontal check
-fires and the chain breaks within ~3 frames. Capping body-only continuity would
-trade that for locking out an owner legitimately turned toward a second monitor.
+screen* to do anything with the machine. The moment they do, the face becomes
+judgeable and one of two things happens — a confident mismatch breaks the chain
+in ~3 frames, or an ambiguous one starts a 5 s clock (`unconfirmedLimit`) after
+which presence stops advancing. Capping *unjudgeable* continuity as well would
+trade that for locking out an owner turned toward a second monitor, which is why
+turned-away faces and torsos are deliberately left unbounded.
 
-### 4. "Never Countdown" and a broken recognizer
+### 3. "Never Countdown" and a broken recognizer
 
 **Status:** handled by a fallback. **Added:** v1.3.0.
 
@@ -100,30 +83,47 @@ would reset before it could notice.
 and instant, then a short countdown to start appearing. Any successful match
 clears the counter and instant locking resumes.
 
-### 5. A camera failure recovers on its own
+### 4. A camera failure recovers on its own, indefinitely
 
-**Status:** fixed. **Added:** after a real incident — the app sat unprotected for
-hours and reported "Camera failed to start".
+**Status:** fixed, then redesigned. **Redesigned:** after a second occurrence.
 
-A camera that fails to deliver frames used to call `pause()`, which stamps
-`lastDecisionAt`. That stamp is what makes a *deliberate* pause survive sleep and
-lock until the next schedule boundary — correct for a user's choice, badly wrong
-for a hardware stumble. A one-second hiccup at 09:05 therefore disabled
-protection until 20:00, with only a dismissible modal as evidence.
+Two separate faults produced the same symptom — the app running while the camera
+sat off.
 
-Now a failure enters `.cameraUnavailable` and retries after 30 s, 60 s, then
-300 s, without consuming a schedule decision. Any delivered frame resets the
-count. Only after all three retries fail does it become a real pause with an
-alert. The menu-bar icon shows a struck-through camera throughout and the status
-line reads "Camera unavailable — retrying", so it can never be mistaken for an
-ordinary pause.
+*First:* a failure called `pause()`, which stamps the timestamp that makes a
+**deliberate** pause survive until the next schedule boundary. A one-second
+hiccup therefore disabled protection for hours.
 
-**What to look for:** open Photo Booth (taking the camera), then Start
-Monitoring. Expect the struck-through icon and a retry roughly 30 s later, not an
-immediate permanent pause. Quit Photo Booth and monitoring should resume by
-itself within a couple of minutes.
+*Second:* the replacement retried only three times (30 s / 60 s / 300 s) and then
+gave up permanently. A camera held by another app for more than ~6 minutes —
+Zoom, Photo Booth, or in the observed case a diagnostic — burned the ladder and
+left the machine unprotected for the rest of the day.
 
-### 6. Main-thread stalls delay the lock
+Underneath both was a design flaw: **liveness was checked once, three seconds
+after start, and assumed true forever.** A session that died later was invisible,
+because the "has delivered a frame" flag was sticky.
+
+Liveness is now a **continuously supervised invariant**. `FaceMonitor` records
+the instant of every frame; the 1 Hz tick asserts that the gap is under 3 s.
+Frames arrive at the sensor's own rate regardless of the analysis throttle, so a
+gap is unambiguous. One rule covers "never came up" and "died later", and the
+grace-expiry path shares it, so the two can't disagree.
+
+On a stale camera the app now asks a different question: *was absence already
+proven before we went blind?* If the grace period had already elapsed, that
+evidence was gathered while we could still see, so it locks — once. Otherwise it
+holds the screen, enters `cameraUnavailable`, and retries at 30 s / 60 s / then
+every 5 minutes **forever**, because the reason to keep trying never expires.
+Locking repeatedly because our own camera is broken is a trap, not protection.
+The user is told once; after that the struck-through icon and status line carry
+it.
+
+**What to look for:** open Photo Booth, then Start Monitoring. Expect the
+struck-through camera icon, one alert after ~6 minutes, and **no permanent
+pause**. Quit Photo Booth and monitoring must resume on its own within 5 minutes,
+with no click.
+
+### 5. Main-thread stalls delay the lock
 
 **Status:** inherent, measured.
 
@@ -141,7 +141,7 @@ applications and system hitches.
 **What to look for:** a lock landing visibly later than the countdown reached
 zero, correlating with the machine being busy.
 
-### 7. Photo or video spoofing
+### 6. Photo or video spoofing
 
 **Status:** cannot be fixed on this hardware. There is no liveness signal
 available from an RGB webcam without depth. A photo of the owner can cancel a
@@ -194,17 +194,6 @@ or the schedule. `./build.sh --install` first.
       photo of someone else): first lock is instant, and after the second a 3 s
       countdown appears so Esc ×3 becomes available again.
 
-### Camera idling
-
-- [ ] Type steadily for `cameraRestAfter` seconds: icon changes to 💤 and the
-      camera LED goes out.
-- [ ] Pause typing: camera reopens, and you're re-matched without a blackout.
-- [ ] **Hold a key down for 30 s** (this is watch-list entry 2): the icon stays
-      💤 and the LED stays off for the whole time. That is the accepted, unbounded
-      blind window — it is *expected* here, not a bug. If the forced wake is ever
-      re-enabled, this is the check that should start alternating instead.
-- [ ] Set **Never Idle**: icon stays on the face icon, never 💤, LED stays on.
-
 ### Camera health
 
 - [ ] Hold the camera open in another app (Photo Booth), then Start Monitoring:
@@ -233,6 +222,20 @@ or the schedule. `./build.sh --install` first.
 - [ ] Enroll from a cold launch **off hours** (session never started): preview
       appears, no black frame, no crash.
 - [ ] Cancel during enrollment: previous profile still works.
+- [ ] **All four stages advance**: straight, one turn, the other turn, head down.
+      No stage sits at a partial percentage while you hold the pose it asked for.
+- [ ] **Turn right first** on the "turn left" stage: it still advances, and the
+      next stage then requires the left turn. The gates take two opposite turns
+      in whichever order they come — the preview is mirrored, so the on-screen
+      direction and the sign of yaw need not agree.
+- [ ] **Recapture** from a later stage: progress drops by exactly that stage's
+      samples, and the redone stage judges direction against the stage before it.
+- [ ] Read the verification line's **worst pose** score (leave-one-out, so it is
+      not flattered by the samples that built the profile). Below the match
+      threshold means the owner's own weakest pose sits under the bar — lower
+      `matchThreshold` rather than shipping that.
+- [ ] If a stage stalls, read `~/Library/Logs/LockscreenDah/enrollment-poses.log`
+      (angles only, survives Re-Enroll) before touching a gate constant.
 
 ### Panel layout
 

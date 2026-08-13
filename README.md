@@ -34,12 +34,14 @@ corner. Face the screen again to cancel, or let it expire to lock the Mac.
   keeps your session open. Losing both for the grace period triggers a
   countdown — and a face already confirmed as not you never counts toward
   it, so simply sitting in your seat buys a stranger no extra time.
-- **Camera rests while you type**, waking (and re-verifying identity) on the
-  next pause, for near-zero CPU during typing-heavy stretches.
+- **The camera is never switched off while monitoring.** There is no
+  idle-while-typing mode: it substituted keystrokes for a verified face for a
+  duration an intruder could extend at will, which is the one thing this app
+  exists to prevent.
 - **Discreet blackout countdown**: reads as a sleeping display, not a
   "you're being watched" banner. A face match cancels it; there is no
   unauthenticated way to dismiss it.
-- **Guided enrollment**: three staged poses, automatic live verification,
+- **Guided enrollment**: four staged poses, automatic live verification,
   nothing saved until you confirm.
 - **Active Hours & Days**: auto-starts/pauses on an hour range and a weekday
   selection (default Mon–Fri); manual overrides survive sleep, lock, and
@@ -112,7 +114,6 @@ Status line + menu-bar icon per state:
 | Paused | pause.circle | "Paused" / "Paused (off hours)" / "Paused (Sat not active)" |
 | Watching (enrolled) | faceid | "Watching for you" |
 | Watching (no profile) | ⚠️ exclamationmark.triangle.fill | "Watching for any face" |
-| Camera idle (typing) | 💤 moon.zzz.fill | "Idle while typing" |
 | Countdown / Locked | unchanged from watching | unchanged from watching (the overlay / lock screen is what you see) |
 | Enrolling | person.crop.circle.badge.plus | "Enrolling face…" |
 
@@ -123,8 +124,8 @@ Items:
   **No Face Enrolled** (red, warning icon) until a profile exists, or the
   disabled **Face model missing (run scripts/fetch-model.sh)** if
   `FaceEmbedding.mlmodelc` wasn't bundled
-- **Settings ▸** Start Countdown After / Countdown Duration / Idle When
-  Typing For / Wake From Idle After / Active Hours & Days… / Open at Login:
+- **Settings ▸** Start Countdown After / Countdown Duration /
+  Active Hours & Days… / Open at Login:
   option rows apply immediately and keep the menu open; chosen value shows
   in each item's title (see [Settings](#settings))
 - **About Lockscreen Dah?**: intro, author, version, and an update check
@@ -136,18 +137,16 @@ Items:
 
 Every setting, what it trades off, and which way to turn it.
 
-### Start Countdown After (1/3/5/10 s, default 3)
+### Start Countdown After (1/3/5/10 s, default 1)
 
 How long presence can lapse before the blackout countdown appears.
 
-- **Lower** = faster reaction when you leave, but more false blackouts
-  (glancing at your phone under the desk), and **higher CPU**: the analysis
-  cadence is `delay/4`, floored at 0.25 s and capped at 2.5 s, so 1 s analyzes
-  every frame the sensor produces. Camera idling is available at every delay, but
-  note it opens an **unbounded** blind window (see
-  [docs/TESTING.md](docs/TESTING.md#watch-list)) — pick **Never Idle** if you
-  chose a short delay for vigilance.
-- **Higher** = cheaper (10 s analyzes every ~2.7 s) and calmer, but a stranger
+- **Lower** = faster reaction when you leave, at **higher CPU**: the analysis
+  cadence is `delay/4`, floored at 0.25 s and capped at 2.5 s. Note this scaling
+  means roughly four detection attempts fit inside the window at *any* setting,
+  so a lower value is not more prone to false blackouts — it costs CPU and
+  shortens the time you have to be re-recognised, nothing else.
+- **Higher** = cheaper (10 s analyzes every ~2.5 s) and calmer, but a stranger
   inherits a bigger head start.
 
 **How exact is it?** The countdown fires within a few milliseconds of the
@@ -158,13 +157,16 @@ countdown lands **early** by up to that interval:
 
 | Setting | Effective sampling | Countdown appears after you actually leave |
 |---|---|---|
-| 1 s | 0.33 s | 0.67–1.0 s |
-| 3 s | 1.0 s | 2.0–3.0 s |
-| 5 s | 1.33 s | 3.67–5.0 s |
-| 10 s | 2.67 s | 7.3–10.0 s |
+| 1 s | ~0.27 s | 0.73–1.0 s |
+| 3 s | ~0.77 s | 2.2–3.0 s |
+| 5 s | ~1.27 s | 3.7–5.0 s |
+| 10 s | ~2.5 s | 7.5–10.0 s |
 
 It never lands late. Closing the gap further means sampling faster, which is
-the CPU tradeoff above. The clock also doesn't start until the camera has
+the CPU tradeoff above. (An earlier version of this table assumed the sensor
+ran at 3 fps, which the code asks for but this hardware does not honour —
+measured delivery is far higher, so the quantisation is finer than previously
+documented.) The clock also doesn't start until the camera has
 delivered its first frame, so opening a session never eats into your delay.
 
 ### Countdown Duration (3/5/10 s or Never Countdown, default 3)
@@ -186,32 +188,6 @@ Length of the blackout countdown before the lock fires.
   that: after two locks with no successful match in between, a minimum 3 s
   countdown is restored regardless of this setting, purely so the escape gesture
   exists again. Any real match clears it and instant locking resumes.
-
-### Idle When Typing For (10/20/30 s / Never Idle, default 10)
-
-Sustained keyboard/mouse use required before the camera goes to sleep
-(input alone proves presence once your identity is established).
-
-- **Lower** = the camera sleeps sooner → more time at ~0% CPU, but more
-  rest/wake cycling (each wake costs a brief session-restart spike).
-- **Higher** = camera watches longer before sleeping; fewer cycles.
-- **Never Idle** = the camera always watches (steady ~8–9% CPU) and the
-  wake option below is disabled. Maximum vigilance: no blind window at all;
-  choose this in hostile environments.
-
-### Wake From Idle After (1/2/3/5 s, default 2)
-
-The typing pause that wakes an idle camera.
-
-- **Lower** = tighter security (the camera's blind window ends at every
-  micro-pause) but the camera wakes constantly during natural typing, so
-  the idle feature saves little.
-- **Higher** = the camera sleeps through natural pauses (real savings), but
-  **two costs**: departure detection starts up to this long after your last
-  keystroke, and a stranger who took over mid-idle stays invisible until
-  they pause typing this long. Every wake is an identity gate (only a fresh
-  match restores presence), so post-pause lockout is
-  ~wake + grace + countdown regardless of this value.
 
 ### Active Hours & Days (default 9:00 AM–8:00 PM, Mon–Fri)
 
@@ -247,7 +223,7 @@ just the first), clearing out any stale entry before re-registering — a
 rebuild re-signs the app, and macOS's login-item registration doesn't
 reliably survive that on its own.
 
-### Hidden: match threshold (default 0.35)
+### Hidden: match threshold (default 0.45)
 
 ```sh
 defaults write com.xavierloo.lockscreen-dah matchThreshold -float 0.3
@@ -256,16 +232,19 @@ defaults write com.xavierloo.lockscreen-dah matchThreshold -float 0.3
 (The `-float` matters: a bare number is stored as a string and ignored.)
 Cosine similarity for "this face is me". **Lower** = fewer false countdowns
 in bad lighting / unusual looks, but easier for a look-alike to pass.
-**Higher** = stricter identity, more false countdowns. Landmark-aligned
-matches typically score 0.6+; the lenient default leaves room for the
-unaligned fallback used when landmarks fail (strong profile views). Clamped
-at read time to **[0.2, 0.9]** so a stray value can't turn matching into
-"everyone passes" or "no one ever does".
+**Higher** = stricter identity, more false countdowns. With all four poses
+enrolled, a held-out live frame scores ~0.96 and the weakest enrolled pose
+~0.71, which is what the 0.45 default is set against — measured, not assumed.
+The floor is head-down: it scores lowest *and* is held longest while typing, so
+it is the pose that decides how far this can be tightened. Clamped at read time
+to **[0.2, 0.9]** so a stray value can't turn matching into "everyone passes"
+or "no one ever does".
 
 ## How it works
 
 ```
-AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
+AVCaptureSession (640x480 YUV; the sensor is asked for its slowest rate,
+  which some cameras ignore — the analysis throttle is what bounds cost)
   → adaptive throttle (idle scales with the countdown delay: one analysis per
     delay/4 s, clamped 0.25–2.5 s; every frame while confirming absence / counting down)
   → Vision face detection (any head angle); upper-body detection only on face-less frames
@@ -279,12 +258,25 @@ AVCaptureSession (640x480 YUV, sensor capped ~3 fps)
   first**: Vision landmarks put the pupils on canonical positions before
   embedding, which is what makes matching robust across head tilt, eye angle,
   and distance (a plain bounding-box crop is the fallback when landmarks fail).
-- **Enrollment** opens a guided window: three staged poses (straight ahead,
-  turn left, turn right), then an automatic live verification test against
-  the candidate profile. Nothing is saved until you confirm, and your
+- **Enrollment** opens a guided window: four staged poses (straight ahead, turn
+  one way, turn the other, then look down at the keyboard), then an automatic
+  live verification test against the candidate profile. Each stage checks that
+  the frame actually shows the pose asked for and says what to correct — without
+  that, a user who barely moves produces samples that all land in one bucket, no
+  pose template forms, and enrollment "passes" while covering nothing. Which
+  physical direction each turn goes is never assumed: the preview is mirrored
+  while Vision measures the unmirrored buffer, so the stages require two
+  *opposite* turns and let the user's first turn define the pair. Head tilt is
+  judged against the resting pitch captured in the first stage, since a laptop
+  camera reads ~0.2 rad on someone sitting normally. Nothing is saved until you confirm, and your
   existing profile is never touched until then. Enrolling/re-enrolling
   requires Touch ID or your macOS password, so a passerby can't swap it.
   Profile lives at `~/Library/Application Support/LockscreenDah/profile.json`.
+- **Three answers, not two**: a frontal face is scored as *confidently you*
+  (refreshes identity), *confidently not you* (breaks the chain after three
+  consecutive frames), or *ambiguous* — and ambiguity sustains presence exactly
+  as a turned head does. Treating "don't know" as "not you" made the owner's own
+  marginal frames stop the presence clock.
 - **Presence chain**: identity is *established* by a frontal match, then
   *maintained* with no time cap by seat continuity: a face at any angle, or
   an upper body in frame. Work turned toward a second screen for an hour;
@@ -361,8 +353,6 @@ countdown 3 s, wake 2 s):
 |---|---|
 | You leave; empty seat | ~6 s (grace + countdown) |
 | Stranger takes the seat and faces the screen | ~6 s, same as an empty seat — a face already confirmed as not you doesn't buy it any extra time |
-| Stranger takes over during camera idle, then pauses typing ≥ wake threshold | ~8 s after the pause (wake gate: only a match restores presence) |
-| Stranger takes over during camera idle and **never pauses input** past the wake threshold | **Unbounded, and accepted deliberately.** The camera is stopped while resting, and holding a key keeps input flowing — which is exactly what keeps it asleep, so the attacker's own activity sustains the blindness. A forced-wake ceiling was built and measured, then left off: it costs a ~10–18% camera duty cycle forever. **The answer is Never Idle**, which removes the window entirely. See [docs/TESTING.md](docs/TESTING.md) entry 2. |
 | Stranger in the seat who **never faces the screen** (head down, turned away) while the camera watches | No time cap: body detection has no identity check (only the face path does), so a torso in frame maintains presence indefinitely. **Accepted deliberately** — an intruder has to look at the screen to do anything with the machine, and the moment they do the frontal check breaks the chain within ~3 frames. Capping it would instead lock out an owner turned toward a second monitor. |
 
 Structural risks, independent of settings:
@@ -441,7 +431,7 @@ fine for local use and already carries Hardened Runtime).
 ## Appearance changes (glasses, occlusion, makeup)
 
 - **Glasses on/off**: mostly fine; regular clear glasses drop similarity a
-  little but typically stay above the lenient 0.35 threshold. **Sunglasses**
+  little but typically stay above the 0.45 threshold. **Sunglasses**
   hide the eye region and hurt a lot.
 - **Hand half-covering the face**: recognition usually fails but Vision still
   detects a face/body, so the presence chain keeps you present. Sitting down
