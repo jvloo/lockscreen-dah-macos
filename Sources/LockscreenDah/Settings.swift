@@ -17,9 +17,14 @@ enum Settings {
     /// that guarantee explicitly. Same reasoning as `matchThreshold` below.
     private static let durationBounds = (min: 0.5, max: 600.0)
 
-    /// How long the owner's face must be absent before the countdown overlay appears.
+    /// How long the owner's face must be absent before the countdown overlay
+    /// appears. Defaults to the shortest offered value: this is a security tool,
+    /// and it shouldn't ship a weaker default than the one it recommends. The
+    /// cost is CPU, not reliability — the analysis cadence scales with this
+    /// setting (`delay/4`), so roughly four detection attempts fit inside the
+    /// window at *any* value, and only the absolute recovery time shrinks.
     static var gracePeriod: TimeInterval {
-        get { min(max(value(forKey: "gracePeriod", default: 3), durationBounds.min), durationBounds.max) }
+        get { min(max(value(forKey: "gracePeriod", default: 1), durationBounds.min), durationBounds.max) }
         set { defaults.set(newValue, forKey: "gracePeriod") }
     }
 
@@ -30,7 +35,7 @@ enum Settings {
     /// The Esc escape gesture is sized against this: three presses plus a Touch
     /// ID round trip do not fit in 0.5 s, so this floor is the shortest *offered*
     /// countdown rather than the shared duration minimum. `gracePeriod` keeps the
-    /// lower shared floor deliberately, so `cameraRestAvailable` can go false.
+    /// generic duration minimum, which is deliberately lower.
     static let countdownFloor: TimeInterval = 3
 
     static var countdownDuration: TimeInterval {
@@ -46,38 +51,20 @@ enum Settings {
     /// lock immediately on presence lapse, with no overlay and so no Esc.
     static var countdownDisabled: Bool { countdownDuration == 0 }
 
-    /// Sustained typing/mouse use required before the camera goes idle.
-    /// Exactly 0 means "Never Idle" (the camera always watches) and survives the
-    /// clamp; any other out-of-range value is pulled back in, since a tiny or
-    /// negative value would rest the camera almost immediately.
-    static var cameraRestAfter: TimeInterval {
-        get {
-            let stored: TimeInterval = value(forKey: "cameraRestAfter", default: 10)
-            if stored == 0 { return 0 }
-            return min(max(stored, 1), durationBounds.max)
-        }
-        set { defaults.set(newValue, forKey: "cameraRestAfter") }
-    }
-
-    /// Typing pause that wakes an idle camera. Larger = the camera sleeps
-    /// through natural typing pauses (more savings), but departure detection
-    /// is delayed by up to this long after the last keystroke.
-    /// Clamped: 0 or negative would mean the camera can never rest (every tick
-    /// reads as "input has gone quiet"), and an enormous value would leave it
-    /// blind for that long. Both are silently broken rather than useful.
-    static var cameraWakeQuiet: TimeInterval {
-        get { min(max(value(forKey: "cameraWakeQuiet", default: 2), 0.5), 60) }
-        set { defaults.set(newValue, forKey: "cameraWakeQuiet") }
-    }
-
     /// Cosine-similarity threshold for "this face is the owner".
-    /// Crops are landmark-aligned, so genuine matches typically score 0.6+;
-    /// the lenient default leaves room for the unaligned bounding-box
-    /// fallback used when landmarks fail (e.g. strong profile views).
+    ///
+    /// Raised from 0.35 once enrollment covered turned and head-down poses:
+    /// a held-out live frame scored 0.96 against a profile built that way, so
+    /// the old bar sat far below anything the owner actually produces and gave
+    /// that much more room to a stranger. Tightening trades one failure for the
+    /// other, and the trade is deliberate — a missed match costs a lock screen,
+    /// an accepted stranger costs the thing this app exists to prevent.
+    /// Not raised further because the head-down pose is both the weakest scoring
+    /// and the one held longest while typing, so it sets the real floor.
     /// Clamped to a sane band so a stray/tampered defaults value can't turn
     /// matching into "everyone passes" (≤ 0) or "no one ever does" (> 1).
     static var matchThreshold: Float {
-        get { min(max(value(forKey: "matchThreshold", default: 0.35), 0.2), 0.9) }
+        get { min(max(value(forKey: "matchThreshold", default: 0.45), 0.2), 0.9) }
         set { defaults.set(newValue, forKey: "matchThreshold") }
     }
 
@@ -216,26 +203,5 @@ enum Settings {
     /// 0 renders as "Never Countdown": lock the moment presence lapses, with
     /// no overlay at all. Mirrors "Never Idle" below.
     static let countdownOptions: [TimeInterval] = [3, 5, 10, 0]
-    /// 0 renders as "Never Idle".
-    static let cameraRestOptions: [TimeInterval] = [10, 20, 30, 0]
-    static let cameraWakeOptions: [TimeInterval] = [1, 2, 3, 5]
 
-    /// Camera rest is unavailable below this countdown delay. Waking from rest
-    /// is an identity gate, so you must land one fresh match inside the delay
-    /// or get a blackout — and the session was fully stopped, so auto-exposure
-    /// has to re-converge from cold and the first frame or two are often
-    /// unusable. (Session spin-up itself no longer counts against the delay;
-    /// the grace clock starts at the first delivered frame.) At 1 s that leaves
-    /// roughly three attempts. Set to 1 so idling is offered at every delay the
-    /// menu exposes — but on watch, for two reasons documented in
-    /// docs/TESTING.md: auto-exposure re-converging from a cold session start
-    /// can miss those attempts and flash the overlay at a seated user, and
-    /// resting the camera opens a blind window at the very setting someone picks
-    /// for vigilance. Choose "Never Idle" to keep continuous coverage. Below 1 s
-    /// (reachable only via `defaults write`) the menu disables the idle rows and
-    /// says why, rather than accepting the setting and silently ignoring it.
-    static let cameraRestMinimumGrace: TimeInterval = 1
-
-    /// Whether camera rest can operate at the current countdown delay.
-    static var cameraRestAvailable: Bool { gracePeriod >= cameraRestMinimumGrace }
 }

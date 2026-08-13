@@ -16,17 +16,7 @@ final class EnrollmentController {
     private let monitor: FaceMonitor
     private let panel = EnrollmentPanel()
 
-    // Staged capture — each stage shows an instruction, gives the user a
-    // moment to settle into the pose, then collects samples.
-    private struct Stage {
-        let instruction: String
-        let target: Int
-    }
-    private let stages = [
-        Stage(instruction: "Look straight ahead", target: 4),
-        Stage(instruction: "Turn slightly left", target: 4),
-        Stage(instruction: "Turn slightly right", target: 4),
-    ]
+    private let stages = EnrollmentStages.all
     private var totalSamples: Int { stages.reduce(0) { $0 + $1.target } }
     /// 3… 2… 1… countdown before each stage starts capturing.
     private let stageSettleTime: TimeInterval = 3
@@ -42,9 +32,13 @@ final class EnrollmentController {
         case failed     // capture/verify failure: Cancel / Re-Enroll
     }
     private var phase: Phase = .ready
-    private var samples: [EnrollmentSample] = []
+    /// Samples of finished stages, one array per stage. Kept grouped rather
+    /// than flattened so each pose gate is handed exactly the stages that came
+    /// before it — see `EnrollmentStage.accepts`.
+    private var completedStageSamples: [[EnrollmentSample]] = []
+    private var currentStageSamples: [EnrollmentSample] = []
+    private var samples: [EnrollmentSample] { completedStageSamples.flatMap { $0 } + currentStageSamples }
     private var stageIndex = 0
-    private var stageCollected = 0
     private var stageSettleUntil = Date.distantPast
     private var timeout: Timer?
     /// Built after the last stage, verified live, persisted only on Save.
@@ -63,9 +57,10 @@ final class EnrollmentController {
     /// Starts (or restarts, on Re-Enroll) the flow. The caller must already
     /// hold camera permission and have put the coordinator in .enrolling.
     func begin() {
-        samples = []
+        beginPoseLogRun()
+        completedStageSamples = []
+        currentStageSamples = []
         stageIndex = 0
-        stageCollected = 0
         phase = .ready
         candidateProfile = nil
         verifyStreak = 0
@@ -98,7 +93,8 @@ final class EnrollmentController {
         timeout = nil
         panel.dismiss()
         monitor.collectEnrollmentSamples = false
-        samples = []
+        completedStageSamples = []
+        currentStageSamples = []
         phase = .ready
         candidateProfile = nil
     }
@@ -136,10 +132,9 @@ final class EnrollmentController {
         switch phase {
         case .stageDone:
             guard stageIndex > 0 else { return }
-            let previousStage = stages[stageIndex - 1]
-            samples.removeLast(min(previousStage.target, samples.count))
             stageIndex -= 1
-            stageCollected = 0
+            currentStageSamples = []
+            if !completedStageSamples.isEmpty { completedStageSamples.removeLast() }
             panel.setProgress(samples.count)
             startCapturingStage()
         case .succeeded:
@@ -189,6 +184,39 @@ final class EnrollmentController {
         panel.setCancelVisible(true)
     }
 
+    // MARK: - Pose diagnostics
+
+    /// Head angles only — never image data — for the current enrollment run,
+    /// truncated at the start of each. Read this when a stage won't advance:
+    /// every pose gate here is a threshold on real Vision output, and guessing
+    /// at those numbers rather than measuring them has caused every enrollment
+    /// bug in this flow so far.
+    private static let poseLogURL = FileManager.default
+        .urls(for: .libraryDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("Logs/LockscreenDah/enrollment-poses.log")
+
+    private func beginPoseLogRun() {
+        guard let url = Self.poseLogURL else { return }
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int
+        if size ?? 0 > 256_000 { try? Data().write(to: url) }
+        logPose("--- enrollment run ---")
+    }
+
+    private func logPose(_ line: String) {
+        guard let url = Self.poseLogURL,
+              let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
     // MARK: - Detection
 
     /// Fed by the coordinator with every analyzed frame while enrolling.
@@ -222,21 +250,32 @@ final class EnrollmentController {
         panel.setCountdown(nil)
 
         guard let sample = result.enrollmentSample else {
+            logPose("stage=\(stageIndex) no-sample (face in frame, embedding failed)")
             panel.setStatus("Hold still…", isProblem: true)
             return
         }
+        let accepted = stage.accepts(sample, completedStageSamples)
+        logPose(String(
+            format: "stage=%d %@ yaw=%+.3f pitch=%+.3f accepted=%@",
+            stageIndex, stage.instruction, sample.yaw, sample.pitch,
+            accepted ? "YES" : "no"
+        ))
+        guard accepted else {
+            panel.setStatus(stage.correction, isProblem: true)
+            return
+        }
 
-        samples.append(sample)
-        stageCollected += 1
+        currentStageSamples.append(sample)
         panel.setProgress(samples.count)
-        panel.setStageProgress(stageCollected * 100 / stage.target)
+        panel.setStageProgress(currentStageSamples.count * 100 / stage.target)
         panel.setStatus("Hold still…")
 
-        if stageCollected >= stage.target {
+        if currentStageSamples.count >= stage.target {
             timeout?.invalidate()
             timeout = nil
+            completedStageSamples.append(currentStageSamples)
+            currentStageSamples = []
             stageIndex += 1
-            stageCollected = 0
             if stageIndex >= stages.count {
                 // All poses captured — build the candidate and verify
                 // automatically; nothing is saved until the user hits Save.
@@ -305,6 +344,16 @@ final class EnrollmentController {
                 timeout?.invalidate()
                 timeout = nil
                 panel.showVerified(score: similarity)
+                // Surface what the profile actually scored across every captured
+                // pose. The worst pose is the number that matters: it is the
+                // headroom above the live threshold, and therefore how much that
+                // threshold could safely be tightened.
+                if let scores = recognizer.lastEnrollmentScores {
+                    panel.setStatus(String(
+                        format: "Live %.2f · profile worst pose %.2f, mean %.2f across %d templates",
+                        similarity, scores.worst, scores.mean, scores.templates
+                    ))
+                }
                 panel.setPrimary(title: "Save")
                 panel.setSecondary(title: "Verify")
                 panel.setCancelVisible(false)

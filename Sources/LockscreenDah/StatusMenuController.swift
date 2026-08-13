@@ -51,7 +51,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
                 // No enrolled face (or no model) — flag it at a glance.
                 symbol = "exclamationmark.triangle.fill"
             } else {
-                symbol = coordinator.cameraResting ? "moon.zzz.fill" : "faceid"
+                symbol = "faceid"
             }
         case .enrolling: symbol = "person.crop.circle.badge.plus"
         }
@@ -69,27 +69,24 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
 
         let isPaused = coordinator.state == .paused || coordinator.state == .cameraUnavailable
-        // Recognition already proved unreliable, so the way back is through a
-        // fresh profile — say that on the button rather than offering a plain
-        // Start that would silently do nothing.
+        // While a re-enrollment is owed there is exactly one useful action, and
+        // the enrollment row below already is it. Offering a second row that
+        // runs the same code — under a third line of text that also says
+        // "re-enrollment" — reads as three separate choices when there is one.
         let needsReenrollment = isPaused && Settings.reenrollmentRequired
-        let toggleTitle: String
-        if needsReenrollment {
-            toggleTitle = "Re-Enroll to Resume"
-        } else {
-            toggleTitle = isPaused ? "Start Monitoring" : "Pause Monitoring"
+        if !needsReenrollment {
+            let toggle = NSMenuItem(
+                title: isPaused ? "Start Monitoring" : "Pause Monitoring",
+                action: #selector(toggleMonitoring),
+                keyEquivalent: ""
+            )
+            toggle.target = self
+            toggle.image = NSImage(
+                systemSymbolName: isPaused ? "play.fill" : "pause.fill",
+                accessibilityDescription: nil
+            )
+            menu.addItem(toggle)
         }
-        let toggle = NSMenuItem(
-            title: toggleTitle,
-            action: #selector(toggleMonitoring),
-            keyEquivalent: ""
-        )
-        toggle.target = self
-        toggle.image = NSImage(
-            systemSymbolName: needsReenrollment ? "arrow.clockwise" : (isPaused ? "play.fill" : "pause.fill"),
-            accessibilityDescription: nil
-        )
-        menu.addItem(toggle)
 
         let enroll = NSMenuItem(title: "", action: #selector(enrollFace), keyEquivalent: "")
         enroll.target = self
@@ -97,7 +94,9 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             enroll.action = nil
             enroll.title = "Face model missing (run scripts/fetch-model.sh)"
         } else if coordinator.recognizer.hasProfile {
-            enroll.title = "Re-Enroll My Face"
+            // Names the outcome when it's the only way back, so the single row
+            // carries the meaning the removed toggle used to.
+            enroll.title = needsReenrollment ? "Re-Enroll My Face to Resume" : "Re-Enroll My Face"
             enroll.image = NSImage(
                 systemSymbolName: "arrow.clockwise",
                 accessibilityDescription: nil
@@ -145,38 +144,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         // them disabled and AppKit would render their views dimmed.
         settingsMenu.autoenablesItems = false
 
-        // The idle pair is built first so the countdown-delay rows below can
-        // refresh their availability live: camera rest can't operate under a
-        // short delay, and these rows say so rather than silently ignoring it.
-        let idleTitle = "Idle When Typing For"
-        let idleValueLabel: (TimeInterval) -> String = { $0 == 0 ? "Never" : "\(Int($0))s" }
-        let wakeItem = durationSubmenu(
-            title: "Wake From Idle After",
-            options: Settings.cameraWakeOptions,
-            get: { Settings.cameraWakeQuiet },
-            set: { Settings.cameraWakeQuiet = $0 }
-        )
-        let idleItem = durationSubmenu(
-            title: idleTitle,
-            options: Settings.cameraRestOptions,
-            get: { Settings.cameraRestAfter },
-            set: { [weak wakeItem] in
-                Settings.cameraRestAfter = $0
-                wakeItem?.isEnabled = $0 > 0 && Settings.cameraRestAvailable
-            },
-            rowLabel: { $0 == 0 ? "Never Idle" : "\(Int($0)) seconds" },
-            valueLabel: idleValueLabel
-        )
-        let refreshIdleAvailability = { [weak idleItem, weak wakeItem] in
-            let available = Settings.cameraRestAvailable
-            idleItem?.isEnabled = available
-            idleItem?.title = available
-                ? "\(idleTitle) \(idleValueLabel(Settings.cameraRestAfter))"
-                : "\(idleTitle) (needs \(Int(Settings.cameraRestMinimumGrace))s+)"
-            wakeItem?.isEnabled = available && Settings.cameraRestAfter > 0
-        }
-        refreshIdleAvailability()
-
         settingsMenu.addItem(durationSubmenu(
             title: "Start Countdown After",
             options: Settings.gracePeriodOptions,
@@ -187,9 +154,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
                 // computed from the old grace period — recompute it now
                 // rather than waiting for the next real presence observation.
                 self?.coordinator.gracePeriodSettingChanged()
-                // This setting gates camera rest, so the rows below it can
-                // change availability from under the open menu.
-                refreshIdleAvailability()
             }
         ))
         settingsMenu.addItem(durationSubmenu(
@@ -200,8 +164,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             rowLabel: { $0 == 0 ? "Never Countdown" : "\(Int($0)) seconds" },
             valueLabel: { $0 == 0 ? "Never" : "\(Int($0))s" }
         ))
-        settingsMenu.addItem(idleItem)
-        settingsMenu.addItem(wakeItem)
         let hoursTitle: String
         if Settings.scheduleEnabled {
             let span = "\(Settings.formatMinutes(Settings.scheduleStartMinutes))–\(Settings.formatMinutes(Settings.scheduleEndMinutes))"

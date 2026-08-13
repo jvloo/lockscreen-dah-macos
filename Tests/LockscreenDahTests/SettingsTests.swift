@@ -26,8 +26,11 @@ final class SettingsTests: XCTestCase {
     // old polling implementation floored these implicitly; the clamp is what
     // replaces that guarantee.
 
-    func testGracePeriodDefaultsToThree() {
-        XCTAssertEqual(Settings.gracePeriod, 3)
+    func testGracePeriodDefaultsToTheShortestOfferedValue() {
+        // A security tool shouldn't ship a weaker default than the one it
+        // recommends; the cost of the shortest value is CPU, not reliability.
+        XCTAssertEqual(Settings.gracePeriod, 1)
+        XCTAssertEqual(Settings.gracePeriod, Settings.gracePeriodOptions.min())
     }
 
     func testGracePeriodRejectsZeroAndNegatives() {
@@ -87,8 +90,8 @@ final class SettingsTests: XCTestCase {
     }
 
     func testGracePeriodKeepsTheLowerFloorDeliberately() {
-        // Unlike the countdown, grace must be allowed below its menu minimum so
-        // `cameraRestAvailable` can go false. The two floors differ on purpose.
+        // The two floors differ on purpose: the countdown is sized against the
+        // Esc gesture, grace is not.
         Settings.defaults.set(0.5, forKey: "gracePeriod")
         XCTAssertEqual(Settings.gracePeriod, 0.5)
         XCTAssertLessThan(Settings.gracePeriod, Settings.countdownFloor)
@@ -104,24 +107,6 @@ final class SettingsTests: XCTestCase {
     func testLockLoopCounterSaturatesInsteadOfGrowingUnbounded() {
         Settings.consecutiveLocksWithoutMatch = 10_000
         XCTAssertLessThanOrEqual(Settings.consecutiveLocksWithoutMatch, 1000)
-    }
-
-    // MARK: - Camera rest availability
-
-    func testCameraRestIsAvailableAtEveryOfferedCountdownDelay() {
-        for option in Settings.gracePeriodOptions {
-            Settings.gracePeriod = option
-            XCTAssertTrue(Settings.cameraRestAvailable, "idling should be offered at \(option)s")
-        }
-    }
-
-    func testCameraRestIsUnavailableBelowTheMinimum() {
-        // Only reachable via `defaults write`. Below 1 s a woken camera can't
-        // land even one match before the delay expires, so the rows are disabled
-        // with the reason shown rather than silently ignored.
-        Settings.defaults.set(0.5, forKey: "gracePeriod")
-        XCTAssertLessThan(Settings.gracePeriod, Settings.cameraRestMinimumGrace)
-        XCTAssertFalse(Settings.cameraRestAvailable)
     }
 
     func testMatchThresholdIsClampedToASaneBand() {

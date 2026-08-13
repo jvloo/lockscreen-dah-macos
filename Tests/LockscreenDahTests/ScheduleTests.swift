@@ -153,39 +153,6 @@ final class ScheduleTests: XCTestCase {
         XCTAssertTrue(Settings.schedule.isActive(at: at(hour: 0, minute: 10)))
     }
 
-    func testCameraRestAfterPreservesNeverButClampsOtherValues() {
-        Settings.cameraRestAfter = 0
-        XCTAssertEqual(Settings.cameraRestAfter, 0, "0 means Never Idle and must survive")
-
-        Settings.defaults.set(0.01, forKey: "cameraRestAfter")
-        XCTAssertGreaterThanOrEqual(Settings.cameraRestAfter, 1, "must not rest the camera almost immediately")
-
-        Settings.defaults.set(-5.0, forKey: "cameraRestAfter")
-        XCTAssertGreaterThanOrEqual(Settings.cameraRestAfter, 1)
-    }
-
-    func testCameraWakeQuietIsClamped() {
-        // 0 or negative would make every tick read as "input has gone quiet".
-        Settings.defaults.set(0.0, forKey: "cameraWakeQuiet")
-        XCTAssertGreaterThanOrEqual(Settings.cameraWakeQuiet, 0.5)
-        Settings.defaults.set(-1.0, forKey: "cameraWakeQuiet")
-        XCTAssertGreaterThanOrEqual(Settings.cameraWakeQuiet, 0.5)
-        Settings.defaults.set(9_999.0, forKey: "cameraWakeQuiet")
-        XCTAssertLessThanOrEqual(Settings.cameraWakeQuiet, 60, "the camera must not stay blind that long")
-    }
-
-    func testEveryOfferedIdleAndWakeOptionSurvivesItsClamp() {
-        for option in Settings.cameraRestOptions {
-            Settings.cameraRestAfter = option
-            XCTAssertEqual(Settings.cameraRestAfter, option)
-        }
-        for option in Settings.cameraWakeOptions {
-            Settings.cameraWakeQuiet = option
-            XCTAssertEqual(Settings.cameraWakeQuiet, option)
-        }
-    }
-
-
     // MARK: - Active days
 
     func testDefaultsToMondayThroughFriday() {

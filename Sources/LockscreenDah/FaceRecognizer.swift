@@ -7,6 +7,11 @@ import Vision
 struct EnrollmentSample {
     let embedding: [Float]
     let yaw: Float
+    /// Signed, but the sign convention is deliberately never relied on: the
+    /// "tilted" stage gates on magnitude, so whichever direction a given user
+    /// tips their head becomes their tilted bucket without the code having to
+    /// know which way Vision counts as positive.
+    let pitch: Float
 }
 
 /// v2 profile: multiple pose templates (overall + center/left/right buckets)
@@ -16,6 +21,15 @@ struct FaceProfile: Codable {
     var version: Int
     var createdAt: Date
     var templates: [[Float]]
+    /// Resting head pitch measured during enrollment.
+    ///
+    /// A laptop camera sits above the screen looking down, so a seated user reads
+    /// a non-zero pitch (~0.2 rad measured) while facing straight ahead — and the
+    /// offset differs with screen height, chair, and external cameras. Judging
+    /// tilt against absolute zero therefore means something different on every
+    /// desk. Optional so profiles written before this decode unchanged; nil falls
+    /// back to absolute.
+    var baselinePitch: Float?
 }
 
 /// Computes identity embeddings for face crops via a bundled Core ML model
@@ -26,6 +40,18 @@ struct FaceProfile: Codable {
 /// degrades to presence-only (any face counts as the owner).
 final class FaceRecognizer {
     static let embeddingSize = 112
+    /// How far from the user's *resting* pitch counts as tilted (radians, ~14°).
+    /// Relative, not absolute: measured resting pitch is ~0.2 on a laptop and
+    /// differs per desk, so an absolute bar would reject a straight-ahead pose on
+    /// one setup and accept a barely-tilted one on another. Shared by the
+    /// enrollment stage gate and the bucket so they can't disagree — a stage that
+    /// accepts samples the bucket then rejects would pass enrollment while
+    /// silently improving nothing.
+    static let tiltedPitch: Float = 0.25
+    /// A turn far enough to be a distinct pose. Measured: a deliberate "slight"
+    /// turn reaches only ~0.15 rad, so an 0.15 gate rejects real turns — which is
+    /// exactly what stalled enrollment.
+    static let turnedYaw: Float = 0.09
 
     // Canonical ArcFace eye positions in a 112x112 crop, bottom-left origin
     // (top-left template: L=(38.2946, 51.6963), R=(73.5318, 51.5014)).
@@ -38,6 +64,16 @@ final class FaceRecognizer {
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let deviceRGB = CGColorSpaceCreateDeviceRGB()
     private var cropBuffer: CVPixelBuffer?
+    /// What the last profile build scored, so a threshold can be chosen from
+    /// evidence rather than intuition. Every threshold in this app was picked by
+    /// reasoning; the scores were computed and thrown away.
+    struct EnrollmentScores {
+        let worst: Float
+        let mean: Float
+        let templates: Int
+    }
+    private(set) var lastEnrollmentScores: EnrollmentScores?
+
     private let profileLock = NSLock()
     private var _profile: FaceProfile?
 
@@ -71,6 +107,13 @@ final class FaceRecognizer {
 
     /// Presence-only mode: no model or no enrolled owner yet.
     var isPresenceOnly: Bool { !hasModel || !hasProfile }
+
+    /// The enrolled resting pitch, or 0 for profiles predating it.
+    var baselinePitch: Float {
+        profileLock.lock()
+        defer { profileLock.unlock() }
+        return _profile?.baselinePitch ?? 0
+    }
 
     // MARK: - Matching
 
@@ -216,29 +259,86 @@ final class FaceRecognizer {
     /// plus per-pose means bucketed by yaw) and self-checks that the samples
     /// actually match their own profile. Nothing is persisted — the caller
     /// verifies live against the candidate, then `commit`s it.
+    /// Builds the template set and resting pitch for a group of samples.
+    /// Separated out so enrollment can rebuild it with one sample held back, to
+    /// score that sample against templates it did not contribute to.
+    private static func buildTemplates(
+        from samples: [EnrollmentSample], dimensions: Int
+    ) -> ([[Float]], Float) {
+        // The overall mean goes in first, but note it gets *less* discriminative
+        // as pose coverage grows — averaging across level and tilted faces blurs
+        // it, and a blurry template is exactly the kind that accepts strangers.
+        // It earns its place while buckets may be too sparse to form; if pose
+        // coverage becomes reliable it is the first template to reconsider.
+        var templates: [[Float]] = [mean(of: samples.map(\.embedding), dimensions: dimensions)]
+
+        // Tilt is bucketed *before* yaw and removed from it. A head tipped down
+        // and slightly left belongs in one bucket, not smeared across two —
+        // mixing poses inside a bucket produces the same blurry mean as above.
+        // Baseline comes from the least-tilted samples, which are the
+        // straight-ahead ones — the pose the first stage asks for.
+        let sortedByTilt = samples.map(\.pitch).sorted { abs($0) < abs($1) }
+        let restingCount = max(1, sortedByTilt.count / 3)
+        let restingPitch = sortedByTilt.prefix(restingCount).reduce(0, +) / Float(restingCount)
+        let tilted = samples.filter { abs($0.pitch - restingPitch) > tiltedPitch }
+        let level = samples.filter { abs($0.pitch - restingPitch) <= tiltedPitch }
+        let buckets: [(String, [EnrollmentSample])] = [
+            ("tilted", tilted),
+            // Named for readability only — which physical direction each sign
+            // corresponds to is never assumed. All that matters is that the two
+            // turns land in different buckets. Uses the same threshold the stage
+            // gate does, so a sample a stage accepted can't fail to bucket.
+            ("center", level.filter { abs($0.yaw) < turnedYaw }),
+            ("turnedOneWay", level.filter { $0.yaw <= -turnedYaw }),
+            ("turnedOtherWay", level.filter { $0.yaw >= turnedYaw }),
+        ]
+        for (_, bucket) in buckets where bucket.count >= 2 {
+            templates.append(mean(of: bucket.map(\.embedding), dimensions: dimensions))
+        }
+        return (templates, restingPitch)
+    }
+
     func makeCandidateProfile(samples: [EnrollmentSample]) throws -> FaceProfile {
         guard let dimensions = samples.first?.embedding.count, dimensions > 0 else {
             throw enrollmentError("No enrollment samples captured.")
         }
 
-        var templates: [[Float]] = [Self.mean(of: samples.map(\.embedding), dimensions: dimensions)]
-        let buckets: [(String, (Float) -> Bool)] = [
-            ("center", { abs($0) <= 0.15 }),
-            ("left", { $0 < -0.15 }),
-            ("right", { $0 > 0.15 }),
-        ]
-        for (_, contains) in buckets {
-            let bucket = samples.filter { contains($0.yaw) }.map(\.embedding)
-            if bucket.count >= 2 {
-                templates.append(Self.mean(of: bucket, dimensions: dimensions))
-            }
-        }
+        // The overall mean goes in first, but note it gets *less* discriminative
+        // as pose coverage grows — averaging across level and tilted faces blurs
+        // it, and a blurry template is exactly the kind that accepts strangers.
+        // It earns its place while buckets may be too sparse to form; if pose
+        // coverage becomes reliable it is the first template to reconsider.
+        let (templates, restingPitch) = Self.buildTemplates(from: samples, dimensions: dimensions)
 
         // Self-check (guards against a corrupted enrollment locking the user
         // out repeatedly): every capture should strongly match the profile it
         // just produced.
-        let profile = FaceProfile(version: 2, createdAt: Date(), templates: templates)
-        let similarities = samples.map { similarity(of: $0.embedding, to: profile) }
+        let profile = FaceProfile(
+            version: 2, createdAt: Date(), templates: templates, baselinePitch: restingPitch
+        )
+        // Scored leave-one-out: each sample is measured against templates built
+        // from the *other* samples. Scoring a sample against a profile it helped
+        // build flatters it — the template partly is that sample — and these
+        // numbers are what a decision to tighten `matchThreshold` rests on, so
+        // the bias was live: it reads as headroom that doesn't exist.
+        let similarities = samples.indices.map { index in
+            var others = samples
+            others.remove(at: index)
+            let (heldOut, baseline) = Self.buildTemplates(from: others, dimensions: dimensions)
+            return similarity(
+                of: samples[index].embedding,
+                to: FaceProfile(version: 2, createdAt: profile.createdAt,
+                                templates: heldOut, baselinePitch: baseline)
+            )
+        }
+        // The *worst* pose is what decides whether the live threshold is safe to
+        // tighten — a good mean can hide one pose scoring near the bar, which is
+        // precisely the case that produces false countdowns in normal use.
+        lastEnrollmentScores = EnrollmentScores(
+            worst: similarities.min() ?? 0,
+            mean: similarities.reduce(0, +) / Float(similarities.count),
+            templates: templates.count
+        )
         let meanSimilarity = similarities.reduce(0, +) / Float(similarities.count)
         guard meanSimilarity >= 0.5 else {
             throw enrollmentError(

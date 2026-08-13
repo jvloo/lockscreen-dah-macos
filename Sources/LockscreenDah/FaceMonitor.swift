@@ -11,9 +11,16 @@ struct DetectionResult {
     var bodyCount: Int
     /// A face positively matched the enrolled owner (any face when unenrolled).
     var ownerMatched: Bool
-    /// A near-frontal face was seen that didn't match the owner (similarity
-    /// below `matchThreshold`) — not just a turned/ambiguous head.
+    /// A judgeable face was seen that is *confidently* not the owner. An
+    /// unmatched-but-ambiguous face does not set this: "don't know" must not be
+    /// reported as "not you".
     var strangerSeen: Bool
+    /// A judgeable face failed to match without being confidently a stranger.
+    /// Distinct from `strangerSeen` because the model is unsure — but distinct
+    /// from a turned-away face too, because here it *could* see and still
+    /// couldn't confirm. Sustained indefinitely, that is how an ambiguous
+    /// intruder would hold the screen, so the chain caps how long it accepts it.
+    var frontalButUnmatched: Bool
     /// Sample from the largest near-frontal face — only populated in enrollment mode.
     var enrollmentSample: EnrollmentSample?
     /// When the frame was delivered, captured before any analysis ran. The
@@ -23,9 +30,13 @@ struct DetectionResult {
     var capturedAt: TimeInterval
 }
 
-/// Low-footprint webcam face watcher: 640x480 capture capped at ~3 fps at the
-/// sensor, with Vision analysis further throttled to `analysisInterval`. The
-/// embedding model only runs on frames where a face was actually detected.
+/// Low-footprint webcam face watcher: 640x480 capture with Vision analysis
+/// throttled to `analysisInterval`, and the embedding model run only on frames
+/// where a face was actually detected.
+///
+/// The analysis throttle is what bounds the cost. The sensor is *asked* for its
+/// slowest supported rate, but that request is not always honoured — see
+/// `configureIfNeeded` — so no particular frame rate should be assumed.
 final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     /// Called on an internal queue for every analyzed frame.
     var onResult: ((DetectionResult) -> Void)?
@@ -45,8 +56,8 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     // sync hop from main could stall the UI behind a whole frame analysis —
     // exactly the kind of stall that would blow the countdown's timing.
     private let stateLock = NSLock()
-    private var framesSinceStart = 0
     private var firstFrame: TimeInterval?
+    private var lastFrame: TimeInterval?
     private var interval: TimeInterval = 1.5
     private var enrollmentMode = false
 
@@ -68,11 +79,46 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// Enrollment only accepts near-frontal samples (~45°) so the stored
     /// profile is clean; presence detection accepts any head angle.
     private let maxEnrollmentYaw: Float = 0.8
-    /// Only faces this frontal (~30°) are eligible to be declared a stranger —
-    /// profile embeddings are too unreliable to accuse anyone.
+    /// A face is only *judgeable* — eligible to be accused — when it is
+    /// near-frontal on both axes (radians, ~30°). Yaw alone was not enough: a
+    /// head tipped down at the keyboard is frontal left-to-right, so it was being
+    /// judged, failed, and accused the owner's own face. Profile embeddings are
+    /// too unreliable to accuse anyone off-angle.
+    ///
+    /// The pitch tolerance is an informed guess, not a tuned value — see
+    /// docs/TESTING.md.
     private let maxStrangerYaw: Float = 0.5
+    private let maxStrangerPitch: Float = 0.5
+    /// Below this similarity a frontal face is *confidently* not the owner.
+    ///
+    /// Deliberately far below `matchThreshold`, leaving an ambiguous band
+    /// between them. Different identities cluster near zero against a
+    /// multi-template profile, so that band is where the owner's own marginal
+    /// frames live — head tipped down at the keyboard, a moment of bad light —
+    /// not a stranger's.
+    ///
+    /// This band existed, was removed, and is now back. It was removed because a
+    /// stranger scoring inside it could hold the screen open indefinitely — but
+    /// that was a fault in the *continuity* rule, which counted any face
+    /// regardless of identity. Continuity now ignores a flagged face
+    /// (`PresenceTracker.observe`), so the fault is fixed at its source and
+    /// collapsing the band only cost the owner false countdowns.
+    private let strangerSimilarity: Float = 0.15
     /// At most this many faces get the (pricier) embedding pass per frame.
     private let maxFacesToMatch = 4
+
+    /// Whether the model can fairly be asked about this face. A missing angle
+    /// counts as off-angle: the safe reading of "unknown" is "don't judge",
+    /// because judging wrongly accuses the owner.
+    private func isJudgeable(_ face: VNFaceObservation) -> Bool {
+        guard let yaw = face.yaw?.floatValue, let pitch = face.pitch?.floatValue else { return false }
+        // Pitch is judged against the resting pose recorded at enrollment. A
+        // laptop camera looks down at you, so "level" is ~0.2 rad here and
+        // different again on another desk; an absolute bar would mean a
+        // different thing for every user.
+        return abs(yaw) <= maxStrangerYaw
+            && abs(pitch - recognizer.baselinePitch) <= maxStrangerPitch
+    }
 
     init(recognizer: FaceRecognizer) {
         self.recognizer = recognizer
@@ -153,21 +199,22 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
 
     private func resetLiveness() {
         stateLock.lock()
-        framesSinceStart = 0
         firstFrame = nil
+        lastFrame = nil
         stateLock.unlock()
     }
 
-    /// Whether the capture session has delivered at least one frame since the
-    /// most recent `start()`. This is the real "the camera is working"
-    /// invariant, and deliberately stronger than `session.isRunning`: a
-    /// session can report running while delivering nothing (output never
-    /// attached, device wedged), and frames keep arriving even with the lens
-    /// covered — so this measures the pipeline, not whether anyone is visible.
-    var hasDeliveredFrame: Bool {
+    /// When the most recent frame arrived, or nil if none has since `start()`.
+    ///
+    /// This is the app's liveness signal and it is *continuous*: frames arrive at
+    /// the sensor's own rate regardless of the analysis throttle, so a gap means
+    /// the pipeline has stopped rather than that we're sampling slowly. Checking
+    /// it once at startup — as an earlier design did — could not see a session
+    /// that died later, which is the failure the user actually hit.
+    var lastFrameAt: TimeInterval? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return framesSinceStart > 0
+        return lastFrame
     }
 
     /// When this session delivered its first frame, or nil if it hasn't yet.
@@ -207,13 +254,22 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         }
         session.commitConfiguration()
 
-        // Cap the sensor frame rate — the capture pipeline dominates CPU cost.
-        if let range = device.activeFormat.videoSupportedFrameRateRanges.first {
-            let fps = min(max(3, range.minFrameRate), range.maxFrameRate)
+        // Ask the sensor for the slowest rate it admits to supporting. This is a
+        // *request*, not a guarantee, and on some hardware it is simply ignored:
+        // measured on a built-in FaceTime HD Camera whose every format reports
+        // 15-30 fps, the device delivered ~27 fps no matter what — including with
+        // the session preset removed and the format chosen by hand. So do not
+        // document a specific frame rate as fact, and do not build a feature on
+        // the assumption that this worked. What actually bounds the expensive
+        // work is the analysis throttle in captureOutput; this only trims the
+        // capture pipeline on devices that honour it.
+        if let slowest = device.activeFormat.videoSupportedFrameRateRanges
+            .map(\.minFrameRate).min(), slowest > 0 {
             do {
                 try device.lockForConfiguration()
-                device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: Int32(fps))
-                device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Int32(fps))
+                let duration = CMTime(value: 1, timescale: Int32(slowest.rounded()))
+                device.activeVideoMinFrameDuration = duration
+                device.activeVideoMaxFrameDuration = duration
                 device.unlockForConfiguration()
             } catch {
                 // Non-fatal: analysis throttling still bounds the real work.
@@ -234,8 +290,8 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         // Counted before the analysis throttle: delivery alone proves the
         // capture pipeline is alive, whether or not this frame gets analyzed.
         stateLock.lock()
-        framesSinceStart += 1
         if firstFrame == nil { firstFrame = now }
+        lastFrame = now
         let interval = self.interval
         let enrollmentMode = self.enrollmentMode
         stateLock.unlock()
@@ -262,6 +318,7 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             bodyCount: bodyCount,
             ownerMatched: false,
             strangerSeen: false,
+            frontalButUnmatched: false,
             capturedAt: now
         )
 
@@ -277,7 +334,8 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             if let largest, let embedding = recognizer.embedding(for: largest, in: pixelBuffer) {
                 result.enrollmentSample = EnrollmentSample(
                     embedding: embedding,
-                    yaw: largest.yaw?.floatValue ?? 0
+                    yaw: largest.yaw?.floatValue ?? 0,
+                    pitch: largest.pitch?.floatValue ?? 0
                 )
             }
         } else if !faces.isEmpty {
@@ -300,14 +358,17 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                         result.ownerMatched = true
                         break
                     }
-                    // similarity < matchThreshold here (the branch above didn't
-                    // fire) — no separate, laxer "clear stranger" bar below that:
-                    // a gap between the two thresholds left anyone who scored
-                    // between them neither matched nor flagged, and the presence
-                    // chain's seat-continuity fallback (any face keeps it alive)
-                    // then held the screen open for them indefinitely.
-                    if let yaw = face.yaw, abs(yaw.floatValue) <= maxStrangerYaw {
-                        result.strangerSeen = true
+                    // Only judge a face the model can fairly be asked about, and
+                    // only accuse one it is confident about. A judgeable face
+                    // that merely failed to match is reported separately, so the
+                    // chain can bound it without treating "don't know" as
+                    // "not you" — the conflation that put a blackout on screen.
+                    if isJudgeable(face) {
+                        if similarity < strangerSimilarity {
+                            result.strangerSeen = true
+                        } else {
+                            result.frontalButUnmatched = true
+                        }
                     }
                 }
             }

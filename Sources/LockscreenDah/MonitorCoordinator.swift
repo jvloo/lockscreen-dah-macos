@@ -70,51 +70,22 @@ final class MonitorCoordinator {
     /// yet" then means "too early to tell", not "camera broken" — see
     /// `handleGraceExpired`.
     private var cameraStartedAt = -Double.infinity
-    /// How long a session gets to deliver its first frame before absence of
-    /// frames is treated as a real failure.
-    private let cameraStartupAllowance: TimeInterval = 3
+    /// A frame gap longer than this means the pipeline has stopped. Frames arrive
+    /// at the sensor's rate no matter how coarse the analysis throttle is, so
+    /// this is unambiguous — and it doubles as the startup allowance, since
+    /// "never delivered a frame" is just the same gap measured from the start.
+    private let cameraStaleAfter: TimeInterval = 3
     /// Consecutive failures to start the camera. Any delivered frame clears it.
     private var cameraFailures = 0
-    /// Backoff between retries. A transient stumble — the device still settling
-    /// after a wake, or another app releasing it — recovers on the first retry;
-    /// a real fault escalates to a visible pause rather than retrying forever.
+    /// Backoff before each retry, holding at the last value. Retrying never
+    /// stops: the reason to keep trying — that the screen is unprotected — does
+    /// not expire, and a camera held by another app for ten minutes must not
+    /// cost protection for the rest of the day.
     private let cameraRetryDelays: [TimeInterval] = [30, 60, 300]
+    /// Announced once per outage; after that the icon and status line carry it,
+    /// because a modal every five minutes only trains people to dismiss it.
+    private var cameraFailureAnnounced = false
     private lazy var cameraRetryTimer = DeadlineTimer { [weak self] in self?.retryCamera() }
-
-    // Camera rest: while the chain is established and the keyboard/mouse are
-    // in sustained use, input alone proves presence — the capture session
-    // (the app's entire CPU floor) sleeps until input goes quiet. Strangers
-    // are unseen while it rests; the wake-on-quiet keeps that gap bounded by
-    // how long anyone can type without pausing for the wake threshold.
-    private(set) var cameraResting = false {
-        didSet { if oldValue != cameraResting { onStateChange?() } }
-    }
-    private var inputActiveSince: TimeInterval?
-    private var lastCameraWake = -Double.infinity
-    /// When the current rest began, so it can be capped absolutely.
-    private var restStartedAt: TimeInterval?
-    /// Hard ceiling on one rest, or 0 to disable the cap.
-    ///
-    /// **Currently disabled (0), deliberately.** With a cap the blind window is
-    /// bounded, because an intruder holding a key otherwise keeps input flowing —
-    /// which is exactly what keeps the camera asleep, so their own activity
-    /// sustains the blindness rather than ending it. But enforcing it means
-    /// reopening the camera every N seconds forever, which costs a real duty
-    /// cycle (~10-18% on at 10 s versus ~0%) and re-runs auto-exposure each time.
-    /// The blind window is therefore unbounded again, and the answer to that
-    /// threat is the "Never Idle" setting, which removes the window entirely at a
-    /// steady CPU cost the user opts into knowingly. See docs/TESTING.md.
-    ///
-    /// Set this above 0 to re-enable; the peek machinery below is intact.
-    private let cameraRestMaxDuration: TimeInterval = 0
-    /// How long a forced wake looks for the owner before it becomes a real wake.
-    /// A match inside this window returns straight to rest without serving
-    /// `cameraMinAwake`, so re-verifying every 10 s stays cheap — otherwise the
-    /// 20 s minimum would keep the camera awake two-thirds of the time and gut
-    /// the feature.
-    private let cameraPeekWindow: TimeInterval = 2
-    /// Set while a forced wake is looking for the owner; nil during a normal wake.
-    private var peekDeadline: TimeInterval?
 
     /// "Never Countdown" removes the overlay, and with it the Esc gesture — the
     /// only way out when recognition has stopped matching the owner. Being locked
@@ -133,12 +104,6 @@ final class MonitorCoordinator {
         }
         return max(Settings.countdownDuration, minimumEscapeCountdown)
     }
-    /// Sustained input required before the camera may rest (user-configurable).
-    private var cameraRestAfter: TimeInterval { Settings.cameraRestAfter }
-    /// Minimum awake time between rests, so bursty typing can't thrash the session.
-    private let cameraMinAwake: TimeInterval = 20
-    /// Input silence that wakes the camera back up (user-configurable).
-    private var cameraWakeQuiet: TimeInterval { Settings.cameraWakeQuiet }
     /// Cadence while absence is suspected / countdown running. Deliberately
     /// below the sensor's frame period (capped at 3 fps, so 0.333 s) to make
     /// sure every captured frame is actually analyzed: the previous 0.4 s
@@ -255,7 +220,6 @@ final class MonitorCoordinator {
         stopLockTimer()
         cameraRetryTimer.cancel()
         monitor.stop()
-        cameraResting = false
         lastDecisionAt = Date() // a real "not watching" decision — see resolveSchedule
         state = .paused
     }
@@ -280,7 +244,7 @@ final class MonitorCoordinator {
         // is what the user sees; a special status would never be read.
         case .watching, .alerting, .locked:
             if recognizer.isPresenceOnly { return "Watching for any face" }
-            return cameraResting ? "Idle while typing" : "Watching for you"
+            return "Watching for you"
         case .enrolling: return "Enrolling face…"
         }
     }
@@ -292,42 +256,19 @@ final class MonitorCoordinator {
         overlay.dismiss()
         presence.reset()
         lastDecisionAt = Date() // a real "watching" decision — see resolveSchedule
-        cameraResting = false
-        inputActiveSince = nil
-        lastCameraWake = Uptime.now
         monitor.analysisInterval = idleAnalysisInterval
         cameraStartedAt = Uptime.now
         monitor.start()
         startTick(interval: 1)
         state = .watching
         rescheduleGraceTimer()
-        verifyCameraStarted()
     }
 
-    /// `monitor.start()` spins up the capture session asynchronously and can
-    /// fail silently (camera busy, a device-enumeration hiccup right after
-    /// sleep/wake) — confirm a few seconds later that frames are genuinely
-    /// arriving, otherwise the app would sit in `.watching`, reporting
-    /// "Watching for you" with the camera never having come on: a false sense
-    /// of safety, exactly what the fail-closed design elsewhere avoids.
-    ///
-    /// `.alerting` is checked too, not just `.watching`: a grace period at or
-    /// under this allowance expires first, so by the time this runs the app
-    /// may already be counting down off a camera that never started.
-    private func verifyCameraStarted() {
-        // Bound to the session it was scheduled for. Without this, a pending
-        // check from an earlier session judges a newer one: Start, Pause, Start
-        // within the allowance window had the first check fire against a
-        // 1-second-old session, declare a perfectly good camera broken, and
-        // leave monitoring paused — failing open, the one direction this app
-        // must never fail in.
-        let startedAt = cameraStartedAt
-        DispatchQueue.main.asyncAfter(deadline: .now() + cameraStartupAllowance) { [weak self] in
-            guard let self, self.cameraStartedAt == startedAt else { return }
-            guard self.state == .watching || self.isAlerting else { return }
-            guard !self.monitor.hasDeliveredFrame else { return }
-            self.reportCameraFailure()
-        }
+    /// True when the capture pipeline has stopped delivering. Measured from the
+    /// last frame, or from the start when none has arrived — one rule covering
+    /// both "never came up" and "died later".
+    private func cameraIsStale(now: TimeInterval) -> Bool {
+        now - (monitor.lastFrameAt ?? cameraStartedAt) > cameraStaleAfter
     }
 
     private var isAlerting: Bool {
@@ -335,38 +276,47 @@ final class MonitorCoordinator {
         return false
     }
 
-    /// The camera didn't come up. Recover automatically, because the failure was
-    /// automatic — only a repeated failure is treated as a real fault worth
-    /// interrupting the user for.
-    private func reportCameraFailure() {
+    /// The camera stopped delivering. Two things matter here, and they pull in
+    /// opposite directions.
+    ///
+    /// Absence measured while blind is not evidence of absence — locking on it
+    /// would punish the user for our failure, and repeatedly locking because our
+    /// own camera is broken is a trap, not protection. But absence that had
+    /// *already* passed the deadline before we went blind is real evidence,
+    /// gathered while we could still see. So that case locks, once; every other
+    /// case holds the screen and retries.
+    private func handleCameraStopped(now: TimeInterval) {
+        let absenceWasAlreadyProven = now - graceAnchor >= Settings.gracePeriod
+
         overlay.dismiss()
         cancelEscapeAuth()
         stopTick()
         stopGraceTimer()
         stopLockTimer()
         monitor.stop()
-        cameraResting = false
 
-        guard cameraFailures < cameraRetryDelays.count else {
-            // Out of retries: not transient. Now it becomes a real pause, which
-            // does consume a schedule decision and does interrupt the user.
-            cameraFailures = 0
-            pause()
-            showAlert(
-                title: "Camera failed to start",
-                message: "Lockscreen Dah? could not start the camera after several attempts, so your screen is NOT being watched. Monitoring is paused. Check whether another app has the camera open, then choose Start Monitoring."
-            )
+        if absenceWasAlreadyProven {
+            // We saw you leave before we went blind. Locking is warranted, and
+            // the unlock path re-anchors presence so this can't become a loop.
+            lockNow()
             return
         }
 
-        let delay = cameraRetryDelays[cameraFailures]
-        cameraFailures += 1
-        // Note what is NOT done here: `lastDecisionAt` is left alone. Stamping it
-        // would tell the scheduler a decision was made, and monitoring could then
-        // not resume until the next boundary — turning a momentary hiccup into
-        // hours of silent exposure.
         state = .cameraUnavailable
+        // `lastDecisionAt` is deliberately untouched: stamping it would tell the
+        // scheduler a decision was made, and monitoring could then not resume
+        // until the next boundary — turning a momentary fault into hours of
+        // silent exposure.
+        let delay = cameraRetryDelays[min(cameraFailures, cameraRetryDelays.count - 1)]
+        cameraFailures += 1
         cameraRetryTimer.schedule(at: Uptime.now + delay)
+
+        guard cameraFailures >= cameraRetryDelays.count, !cameraFailureAnnounced else { return }
+        cameraFailureAnnounced = true
+        showAlert(
+            title: "Camera unavailable",
+            message: "Lockscreen Dah? can't see through the camera, so your screen is NOT being watched. It will keep trying and resume on its own as soon as the camera is available — check whether another app is using it. The menu bar shows a struck-through camera until then."
+        )
     }
 
     private func retryCamera() {
@@ -517,14 +467,15 @@ final class MonitorCoordinator {
         stopGraceTimer()
         stopLockTimer()
         monitor.stop()
-        cameraResting = false
         state = .locked
     }
 
     // MARK: - Detection handling
 
     private func handleDetection(_ result: DetectionResult) {
-        cameraFailures = 0 // frames are arriving; the camera is demonstrably fine
+        // Frames are arriving; the camera is demonstrably fine.
+        cameraFailures = 0
+        cameraFailureAnnounced = false
         switch state {
         case .watching:
             // Cadence is owned by handleTick: fast sampling kicks in only when
@@ -534,13 +485,8 @@ final class MonitorCoordinator {
             // Stamped with the frame's own capture instant, not "now": the
             // analysis pipeline plus the hop onto this thread is 100-400 ms,
             // and charging that to absence made the countdown that much late.
-            let matched = presence.observe(result, now: result.capturedAt)
-            if matched { Settings.consecutiveLocksWithoutMatch = 0 }
-            // Scheduled re-check satisfied: the owner is still there, so give the
-            // camera straight back rather than burning the full awake minimum.
-            if matched, peekDeadline != nil {
-                enterCameraRest(now: Uptime.now)
-                return
+            if presence.observe(result, now: result.capturedAt) {
+                Settings.consecutiveLocksWithoutMatch = 0
             }
             // Every observation can move lastOwnerSeen forward (or leave it
             // put) — reschedule unconditionally rather than trying to detect
@@ -620,35 +566,14 @@ final class MonitorCoordinator {
     private func handleGraceExpired() {
         guard state == .watching else { return }
         let now = Uptime.now
-        // Camera rest deliberately stops the session, which is not a failure —
-        // but a countdown started from it could never be cancelled by showing
-        // your face, making the lock unavoidable. Wake the camera and let the
-        // fresh grace period decide instead. Reachable when the deadline is
-        // pulled in under the 1 Hz rest tick (e.g. Start Countdown After is
-        // lowered while resting).
-        if cameraResting {
-            wakeCameraFromRest(now: now)
-            return
-        }
         guard now - graceAnchor >= Settings.gracePeriod else {
             rescheduleGraceTimer()
             return
         }
-        // Absence only means something if the camera was actually looking. A
-        // session that has never delivered a frame is evidence of nothing, so
-        // neither black out nor lock on it. Checked before the Instant branch
-        // below so a dead camera can never lock the screen.
-        if !monitor.hasDeliveredFrame {
-            // Still inside session spin-up (first frame lands ~1 s in, which a
-            // short grace period expires inside): too early to call it either
-            // way, so defer the decision to the end of the allowance rather
-            // than alerting or locking on no evidence.
-            let allowanceEnd = cameraStartedAt + cameraStartupAllowance
-            if now < allowanceEnd {
-                scheduleGraceTimer(at: allowanceEnd)
-            } else {
-                reportCameraFailure()
-            }
+        // Absence only means something if the camera was actually looking. One
+        // rule, shared with the tick supervisor, so the two can't disagree.
+        guard !cameraIsStale(now: now) else {
+            handleCameraStopped(now: now)
             return
         }
         // "Never Countdown": nothing to show, so lock straight from here. Note
@@ -703,91 +628,21 @@ final class MonitorCoordinator {
     /// positive match lands. The grace clock restarts from the wake (spin-up
     /// never eats into it) and sampling runs fast, so a facing owner re-matches
     /// in ~1 s; no match within the grace period means a countdown.
-    private func wakeCameraFromRest(now: TimeInterval, peeking: Bool = false) {
-        cameraResting = false
-        restStartedAt = nil
-        inputActiveSince = nil
-        lastCameraWake = now
-        peekDeadline = peeking ? now + cameraPeekWindow : nil
-        presence.breakChain()
-        presence.touch(now: now)
-        monitor.analysisInterval = fastAnalysisInterval
-        cameraStartedAt = now // start() resets frame-delivery liveness
-        monitor.start()
-        rescheduleGraceTimer()
-        verifyCameraStarted() // the restart can fail like any other
-    }
-
-    /// Stops the capture session and hands presence over to input. Called both
-    /// from the sustained-input path and straight from a successful peek, which
-    /// deliberately bypasses `cameraMinAwake` — that guard exists to stop bursty
-    /// typing thrashing the session, and a peek that already found the owner
-    /// isn't thrash.
-    private func enterCameraRest(now: TimeInterval) {
-        cameraResting = true
-        restStartedAt = now
-        peekDeadline = nil
-        presence.touch(now: now)
-        rescheduleGraceTimer()
-        monitor.stop()
-    }
-
-    /// Snapshot of everything the rest decision needs. One place, so a caller
-    /// can't assemble a partial picture of the camera's state.
-    private func cameraRestInputs(now: TimeInterval) -> CameraRestInputs {
-        CameraRestInputs(
-            now: now,
-            secondsSinceInput: Self.secondsSinceLastInput(),
-            isResting: cameraResting,
-            restStartedAt: restStartedAt,
-            inputActiveSince: inputActiveSince,
-            lastCameraWake: lastCameraWake,
-            chainActive: presence.chainActive,
-            restAfter: cameraRestAfter,
-            wakeQuiet: cameraWakeQuiet,
-            minimumAwake: cameraMinAwake,
-            maximumRest: cameraRestMaxDuration,
-            restAvailable: Settings.cameraRestAvailable
-        )
-    }
-
     private func handleTick() {
         switch state {
         case .watching:
             let now = Uptime.now
-            var inputs = cameraRestInputs(now: now)
-
-            switch CameraRestPolicy.decide(inputs) {
-            case .keepResting:
-                // Still typing — input is the presence signal.
-                presence.touch(now: now)
-                rescheduleGraceTimer()
+            // Liveness is supervised continuously rather than checked once at
+            // startup: a session can die at any moment (another app seizes the
+            // device, the driver wedges after a wake) and nothing used to notice.
+            if cameraIsStale(now: now) {
+                handleCameraStopped(now: now)
                 return
-            case .wake(let peeking):
-                // Let the restarted camera deliver a frame at the fast cadence
-                // before this tick's absence check could second-guess it.
-                wakeCameraFromRest(now: now, peeking: peeking)
-                return
-            case .beginResting:
-                enterCameraRest(now: now)
-                return
-            case .none:
-                break
             }
-
-            // A peek that found nobody becomes an ordinary wake — the grace
-            // clock has been running since it started, so absence resolves
-            // itself from here.
-            if let deadline = peekDeadline, now >= deadline {
-                peekDeadline = nil
-            }
-            inputs.inputActiveSince = inputActiveSince
-            inputActiveSince = CameraRestPolicy.inputActiveSince(inputs)
-
-            // The alert itself fires off graceTimer, not this poll — this just
-            // picks the sampling rate: faster once absence is actually
-            // suspected, cheaper once the chain is healthy. Same anchor the
-            // deadline uses, so cadence and deadline can't disagree.
+            // The alert fires off graceTimer, not this poll — this only picks the
+            // sampling rate: faster once absence is actually suspected, cheaper
+            // while the chain is healthy. Same anchor the deadline uses, so
+            // cadence and deadline can't disagree.
             monitor.analysisInterval = now - graceAnchor > Settings.gracePeriod / 2
                 ? fastAnalysisInterval
                 : idleAnalysisInterval
@@ -978,21 +833,6 @@ final class MonitorCoordinator {
             guard let self, self.state == .watching else { return }
             self.beginWatching()
         }
-    }
-
-    /// Seconds since the user last touched keyboard, mouse, or trackpad.
-    /// No Accessibility permission needed — this reads event *timing* only.
-    /// Uses `.hidSystemState` (physical HID input) rather than
-    /// `.combinedSessionState`, so synthetic events posted by other processes
-    /// via CGEventPost can't fake presence and hold the screen open.
-    private static func secondsSinceLastInput() -> TimeInterval {
-        let types: [CGEventType] = [
-            .keyDown, .flagsChanged, .mouseMoved,
-            .leftMouseDown, .rightMouseDown, .scrollWheel,
-        ]
-        return types
-            .map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }
-            .min() ?? .infinity
     }
 
     // MARK: - Camera permission
