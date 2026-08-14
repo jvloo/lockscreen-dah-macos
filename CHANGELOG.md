@@ -5,6 +5,51 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/).
 
+## [1.4.2] - 2026-08-14
+
+### Added
+
+- **Unified logging.** State transitions, supervisor decisions with the
+  conditions that drove them, camera lifecycle, schedule boundaries and locks.
+  Every camera outage this week was diagnosed by reading source and guessing,
+  because the app recorded nothing.
+
+  Nothing derived from a face is logged — no embeddings, no landmarks, no
+  images. Read it with:
+
+  ```sh
+  /usr/bin/log show --last 1h \
+    --predicate 'subsystem == "com.xavierloo.lockscreen-dah"' --style compact
+  ```
+
+  (`log` is also a zsh builtin, so the full path matters.)
+
+### Fixed
+
+- **Every start blacked out a seated user for over a second.** The grace
+  deadline waited for the camera's first frame, but a frame nobody has analysed
+  is as blind as no frame: the first Core ML inference carries model load and
+  ANE warm-up, measured at **2.39 s** after start against a first frame at
+  ~150 ms. A 1 s grace expired entirely inside that window, so recognition was
+  never given the chance to answer before the countdown began.
+
+  This is the intermittent "countdown flickering" reported earlier and wrongly
+  attributed to the ambiguity band — that was a real bug too, but not this one.
+  Found by the logging above, in its first minute of running.
+
+  The deadline now anchors to the first analysis *result*, bounded by an
+  allowance so a pipeline that delivers frames but never results still fails
+  closed rather than never locking.
+
+### Internal
+
+- The coordinator's lock, resume and camera-liveness decisions moved into
+  `PresenceSupervisor`, a pure type with tests. The three bugs shipped this week
+  all lived in 950 lines of AppKit that no test could construct; each is now a
+  one-line assertion, verified by reintroducing the bug and watching the suite
+  fail. Lock and sleep notifications now only prompt an immediate re-decision
+  rather than carrying their own logic, so they cannot drift from the poll.
+
 ## [1.4.1] - 2026-08-14
 
 ### Fixed

@@ -25,7 +25,12 @@ final class MonitorCoordinator {
     }
 
     private(set) var state: State = .paused {
-        didSet { onStateChange?() }
+        didSet {
+            if oldValue != state {
+                Log.state.notice("\(oldValue.logName, privacy: .public) -> \(self.state.logName, privacy: .public)")
+            }
+            onStateChange?()
+        }
     }
     var onStateChange: (() -> Void)?
 
@@ -81,6 +86,12 @@ final class MonitorCoordinator {
     /// "never delivered a frame" is just the same gap measured from the start.
     private let cameraStaleAfter: TimeInterval = 3
     /// Consecutive failures to start the camera. Any delivered frame clears it.
+    /// When the current capture session first produced an analysis result, as
+    /// opposed to a frame. Nil until then; see `graceAnchor`.
+    private var firstResultAt: TimeInterval?
+    /// How long recognition may take to produce its first verdict before
+    /// absence becomes provable anyway.
+    private let analysisWarmupAllowance: TimeInterval = 3
     private var cameraFailures = 0
     /// Backoff before each retry, holding at the last value. Retrying never
     /// stops: the reason to keep trying — that the screen is unprotected — does
@@ -264,6 +275,8 @@ final class MonitorCoordinator {
         lastDecisionAt = Date() // a real "watching" decision — see resolveSchedule
         monitor.analysisInterval = idleAnalysisInterval
         cameraStartedAt = Uptime.now
+        firstResultAt = nil
+        Log.camera.notice("starting capture")
         monitor.start()
         startTick(interval: 1)
         state = .watching
@@ -293,6 +306,7 @@ final class MonitorCoordinator {
     /// case holds the screen and retries.
     private func handleCameraStopped(now: TimeInterval) {
         let absenceWasAlreadyProven = now - graceAnchor >= Settings.gracePeriod
+        Log.camera.error("stopped delivering; absenceAlreadyProven=\(absenceWasAlreadyProven, privacy: .public)")
 
         overlay.dismiss()
         cancelEscapeAuth()
@@ -315,6 +329,7 @@ final class MonitorCoordinator {
         // silent exposure.
         let delay = cameraRetryDelays[min(cameraFailures, cameraRetryDelays.count - 1)]
         cameraFailures += 1
+        Log.camera.notice("retry \(self.cameraFailures, privacy: .public) in \(delay, privacy: .public)s")
         cameraRetryTimer.schedule(at: Uptime.now + delay)
 
         guard cameraFailures >= cameraRetryDelays.count, !cameraFailureAnnounced else { return }
@@ -449,6 +464,7 @@ final class MonitorCoordinator {
     }
 
     private func lockNow() {
+        Log.lock.notice("locking; consecutiveWithoutMatch=\(Settings.consecutiveLocksWithoutMatch + 1, privacy: .public)")
         // Counted before the lock, since the lock itself ends this session.
         Settings.consecutiveLocksWithoutMatch += 1
         enterLockedState()
@@ -458,6 +474,7 @@ final class MonitorCoordinator {
         // notification ever coming) while the desktop stays exposed.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.state == .locked, !ScreenLocker.sessionIsLocked else { return }
+            Log.lock.fault("macOS rejected the lock request; monitoring paused")
             self.pause()
             self.showAlert(
                 title: "Screen lock failed",
@@ -481,6 +498,13 @@ final class MonitorCoordinator {
         // Frames are arriving; the camera is demonstrably fine.
         cameraFailures = 0
         cameraFailureAnnounced = false
+        if firstResultAt == nil {
+            firstResultAt = Uptime.now
+            Log.camera.notice("first analysis result \(self.firstResultAt! - self.cameraStartedAt, format: .fixed(precision: 2), privacy: .public)s after start")
+            // The anchor just moved forward, so any deadline computed from the
+            // old one is now wrong.
+            rescheduleGraceTimer()
+        }
         switch state {
         case .watching:
             // Cadence is owned by handleTick: fast sampling kicks in only when
@@ -575,6 +599,11 @@ final class MonitorCoordinator {
             gracePeriod: Settings.gracePeriod,
             staleAfter: cameraStaleAfter
         )
+        if decision != .doNothing {
+            // The conditions, not just the outcome: which fact drove it is the
+            // whole question when a camera is unexpectedly off.
+            Log.state.notice("supervisor decided \(String(describing: decision), privacy: .public) in \(self.state.logName, privacy: .public): sessionLocked=\(ScreenLocker.sessionIsLocked, privacy: .public) displayAsleep=\(ScreenLocker.displayIsAsleep, privacy: .public) sinceFrame=\(now - (self.monitor.lastFrameAt ?? self.cameraStartedAt), format: .fixed(precision: 1), privacy: .public)s")
+        }
         switch decision {
         case .doNothing: break
         case .resumeFromLocked: resumeFromLocked()
@@ -614,8 +643,20 @@ final class MonitorCoordinator {
     /// entirely inside. Without it, every unlock at grace 1 s blacked out a
     /// seated user before the camera had produced a usable frame.
     private var graceAnchor: TimeInterval {
-        guard let firstFrame = monitor.firstFrameAt else { return presence.lastOwnerSeen }
-        return max(presence.lastOwnerSeen, firstFrame)
+        // A frame nobody has analysed yet is as blind as no frame at all. The
+        // first Core ML inference carries model load and ANE warm-up — measured
+        // at ~2.3 s from first frame on this machine, while the first frame
+        // itself arrived in ~150 ms — so anchoring to the frame let a 1 s grace
+        // expire before recognition could possibly have answered, blacking out a
+        // seated user on every start. Anchor to the first *verdict*.
+        //
+        // Bounded, so a pipeline delivering frames but never results cannot hold
+        // the deadline off indefinitely: past the allowance the anchor stops
+        // sliding and absence becomes provable again. A spurious countdown is a
+        // nuisance; a monitor that can never lock is a broken promise.
+        let readiness = firstResultAt
+            ?? min(Uptime.now, (monitor.firstFrameAt ?? cameraStartedAt) + analysisWarmupAllowance)
+        return max(presence.lastOwnerSeen, readiness)
     }
 
     private func rescheduleGraceTimer() {
@@ -814,6 +855,7 @@ final class MonitorCoordinator {
     /// camera behind a locked screen; resumeFromLocked resolves it at the
     /// next unlock.
     private func applySchedule(within: Bool) {
+        Log.schedule.notice("boundary crossed; withinActiveWindow=\(within, privacy: .public) state=\(self.state.logName, privacy: .public)")
         switch state {
         case .paused where within:
             // Stamp before attempting, even though the attempt below may not

@@ -132,7 +132,9 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             forName: .AVCaptureSessionRuntimeError,
             object: session,
             queue: nil
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            let reason = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
+            Log.camera.error("session runtime error: \(reason?.code ?? 0, privacy: .public); dropping configuration")
             self?.queue.async { self?.teardownConfiguration() }
         }
     }
@@ -234,11 +236,18 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// of the app's life, silently, since nothing else ever re-attempted it.
     private func configureIfNeeded() {
         guard !configured else { return }
+        guard let device = AVCaptureDevice.default(for: .video) else {
+            Log.camera.error("no video device available")
+            return
+        }
         guard
-            let device = AVCaptureDevice.default(for: .video),
             let input = try? AVCaptureDeviceInput(device: device),
             session.canAddInput(input)
-        else { return }
+        else {
+            // The usual cause is another process holding the device.
+            Log.camera.error("cannot open the video device as an input")
+            return
+        }
 
         session.beginConfiguration()
         if session.canSetSessionPreset(.vga640x480) {
