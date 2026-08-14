@@ -554,7 +554,11 @@ final class MonitorCoordinator {
         // re-derived here rather than trusted to arrive. (Each `where` binds to
         // its own pattern — a shared one would apply to the last only.)
         switch state {
-        case .locked where !sessionLocked:
+        // `.locked` covers two unrelated situations — the session locked, or
+        // the display slept without locking — and only the first is undone by
+        // an unlock. Reading a sleeping display as a missed unlock notification
+        // would restart the camera behind a dark screen every display sleep.
+        case .locked where !sessionLocked && !ScreenLocker.displayIsAsleep:
             resumeFromLocked()
             return
         case .watching where sessionLocked, .alerting where sessionLocked:
@@ -879,6 +883,20 @@ final class MonitorCoordinator {
         ) { [weak self] _ in
             guard let self, self.state != .paused, self.state != .enrolling,
                   self.state != .cameraUnavailable else { return }
+            // A lock that was already decided must not be dropped just because
+            // the display went dark. Parking in .locked without locking leaves
+            // the machine unlocked behind a black screen, protected only by
+            // whatever "require password after sleep" setting the user happens
+            // to have — which this app neither sets nor reads.
+            //
+            // Same rule the blind-camera path uses: absence proven *before* we
+            // stopped being able to see it is real evidence. A countdown in
+            // flight is exactly that, and its remaining seconds buy the user
+            // nothing once the screen they would have read them on is off.
+            if self.isAlerting || Uptime.now - self.graceAnchor >= Settings.gracePeriod {
+                self.lockNow()
+                return
+            }
             self.enterLockedState()
         }
         workspace.addObserver(

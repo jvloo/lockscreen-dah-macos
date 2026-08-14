@@ -17,6 +17,14 @@ enum ScreenLocker {
     }
 
     /// Whether the session is actually locked right now.
+    /// Whether the built-in display is asleep. Read directly rather than
+    /// tracked from sleep/wake notifications, for the same reason
+    /// `sessionIsLocked` is: a missed notification would leave the flag lying,
+    /// and a flag that lies about this strands monitoring.
+    static var displayIsAsleep: Bool {
+        CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
     static var sessionIsLocked: Bool {
         guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
         return info["CGSSessionScreenIsLocked"] as? Bool ?? false

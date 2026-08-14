@@ -5,6 +5,27 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] - 2026-08-14
+
+### Fixed
+
+- **The camera restarted behind a sleeping display.** A regression in 1.4.0.
+  `.locked` is entered for two unrelated reasons — the session locked, or the
+  display slept without locking — and the new supervisor read the second as a
+  missed unlock notification. On any Mac that doesn't lock immediately on
+  display sleep, the camera stopped and then came back a second later and ran
+  indefinitely behind a black screen. The supervisor now reads
+  `CGDisplayIsAsleep` directly, rather than tracking a flag that would only be
+  as reliable as the notification setting it.
+
+- **A countdown was abandoned if the display slept before it finished.** The
+  sleep handler parked the app in `.locked` without ever locking, so a machine
+  whose owner had already been proven absent was left unlocked behind a dark
+  screen — protected only by whatever "require password after sleep" setting
+  the user happens to have, which this app neither sets nor reads. Absence
+  proven before the display slept is real evidence, so it now locks, using the
+  same rule the blind-camera path already used.
+
 ## [1.4.0] - 2026-08-13
 
 ### Added

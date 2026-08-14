@@ -241,6 +241,13 @@ or the schedule. `./build.sh --install` first.
 - [ ] Lock, wait for the display to sleep, wake and unlock: same expectation.
 - [ ] While watching, lock via **Fast User Switching**: monitoring must stop
       (camera off) rather than keep watching behind a locked session.
+- [ ] **Let the display sleep while watching** (Ctrl-Shift-Eject, or wait out
+      the display timeout) on a Mac that does *not* require a password
+      immediately. The camera must stay off — it must not come back a second
+      later and run behind a black screen.
+- [ ] **Cover the lens to start a countdown, then sleep the display before it
+      reaches zero.** The screen must be locked when you wake it, not sitting
+      on your unlocked desktop.
 
 ### Enrollment
 
