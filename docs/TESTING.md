@@ -103,11 +103,25 @@ Underneath both was a design flaw: **liveness was checked once, three seconds
 after start, and assumed true forever.** A session that died later was invisible,
 because the "has delivered a frame" flag was sticky.
 
-Liveness is now a **continuously supervised invariant**. `FaceMonitor` records
-the instant of every frame; the 1 Hz tick asserts that the gap is under 3 s.
-Frames arrive at the sensor's own rate regardless of the analysis throttle, so a
-gap is unambiguous. One rule covers "never came up" and "died later", and the
-grace-expiry path shares it, so the two can't disagree.
+*Third:* a screen lock stops the camera and every timer, and the only way back
+was the `screenIsUnlocked` notification — best-effort, so a single dropped one
+stranded the app with the screen unlocked and nothing running to notice.
+
+Liveness is now a **continuously supervised invariant**, owned by a supervisor
+that runs for the life of the app at 1 Hz and is never stopped by a state
+transition — which is the point, since every previous cause was a transition
+that stopped the thing meant to notice. `FaceMonitor` records the instant of
+every frame; the supervisor asserts the gap is under 3 s, and separately that
+the session's lock state and the app's state still agree. Frames arrive at the
+sensor's own rate regardless of the analysis throttle, so a gap is unambiguous.
+One rule covers "never came up" and "died later", and the grace-expiry path
+shares it, so the two can't disagree.
+
+Detection is centralised there; the **remedies** stay where they were, so the
+retry ladder's backoff and the "never lock on evidence gathered while blind"
+rule still apply. Liveness is judged on delivered frames rather than
+`session.isRunning`, which reads false while the session configures and would
+tear the camera down on every start.
 
 On a stale camera the app now asks a different question: *was absence already
 proven before we went blind?* If the grace period had already elapsed, that
@@ -216,6 +230,17 @@ or the schedule. `./build.sh --install` first.
       still monitoring after midnight.
 - [ ] Pause manually mid-window → stays paused until the next boundary, across
       a lock/unlock cycle.
+
+### Lock / unlock recovery
+
+- [ ] Lock (⌃⌘Q) and unlock **five times in a row, quickly**. The camera must
+      resume every time. The unlock notification is best-effort and dropping one
+      used to strand the app with the camera off for good; the supervisor now
+      re-derives lock state every second, so a dropped notification should cost
+      at most ~1 s of delay rather than the session.
+- [ ] Lock, wait for the display to sleep, wake and unlock: same expectation.
+- [ ] While watching, lock via **Fast User Switching**: monitoring must stop
+      (camera off) rather than keep watching behind a locked session.
 
 ### Enrollment
 

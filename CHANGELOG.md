@@ -132,6 +132,24 @@ and this project uses [Semantic Versioning](https://semver.org/).
   was owed, two of which ran the same action. The Start/Pause row is now omitted
   in that state, leaving one row that names the outcome.
 
+- **The camera stayed off after a screen lock, indefinitely.** Locking stops
+  the camera and every timer, and the only way back was the `screenIsUnlocked`
+  notification. `DistributedNotificationCenter` delivery is best-effort, so a
+  single missed one stranded the app with the screen unlocked, the capture
+  device free, and nothing running that could ever notice. Observed in the
+  field; present since v1.3.0.
+
+  Rather than patch that path, recovery is now owned by a **supervisor that
+  runs for the life of the app at a fixed cadence, independent of state**. It
+  re-derives what should be true from facts it can read directly — is the
+  session locked, are frames arriving — and corrects whatever disagrees. This
+  is the third unrelated cause of "monitoring is on but the camera is off"
+  (after a failure path that paused for the day and a retry ladder that gave
+  up), and the pattern was the finding: recovery had been attached to whichever
+  path happened to stop the camera, so any path nobody anticipated had none.
+  Detection is centralised; the existing paths still own the remedies, so their
+  backoff and lock-safety rules continue to apply.
+
 - **Enrollment stalled at 50% of the second turn, asking the user to turn the
   other way while they already were.** The stage was handed one flat list of
   every sample collected so far — including the samples it had just accepted

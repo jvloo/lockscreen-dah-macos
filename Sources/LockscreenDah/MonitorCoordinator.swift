@@ -52,6 +52,11 @@ final class MonitorCoordinator {
     }()
 
     private var tickTimer: Timer?
+    /// Reconciliation timer. Unlike `tickTimer` this is never stopped by any
+    /// state transition, because its entire job is to catch states that stopped
+    /// something they shouldn't have.
+    private var supervisorTimer: Timer?
+    private let supervisionInterval: TimeInterval = 1
     /// Precise one-shot timer for firing the countdown exactly at the grace
     /// deadline — see `rescheduleGraceTimer()`. The 1 Hz `tickTimer` above
     /// only adjusts sampling rate and camera-rest bookkeeping now; it no
@@ -188,6 +193,7 @@ final class MonitorCoordinator {
     /// Launch entry point. No prior decision exists yet to compare a boundary
     /// against, so this always acts on the live schedule directly.
     func startPerSchedule() {
+        startSupervisor()
         lastDecisionAt = Date()
         guard Settings.schedule.isActive(at: Date()) else {
             state = .paused // refreshes the status line to "off hours"
@@ -463,7 +469,6 @@ final class MonitorCoordinator {
     private func enterLockedState() {
         overlay.dismiss()
         cancelEscapeAuth()
-        stopTick()
         stopGraceTimer()
         stopLockTimer()
         monitor.stop()
@@ -509,6 +514,73 @@ final class MonitorCoordinator {
 
     /// 1 s granularity is plenty against a multi-second grace period; only the
     /// countdown redraw during .alerting needs the fast 0.25 s cadence.
+    // MARK: - Supervision
+
+    /// Runs for the entire life of the app, at a fixed cadence, regardless of
+    /// state. Every other timer here is started and stopped by transitions —
+    /// which is exactly why they cannot be trusted to notice a transition that
+    /// went wrong.
+    private func startSupervisor() {
+        supervisorTimer?.invalidate()
+        let timer = Timer(timeInterval: supervisionInterval, repeats: true) { [weak self] _ in
+            self?.superviseInvariants()
+        }
+        timer.tolerance = supervisionInterval / 4
+        RunLoop.main.add(timer, forMode: .common)
+        supervisorTimer = timer
+    }
+
+    /// Re-derives what *should* be true from facts that can be read directly —
+    /// the session's lock state and whether capture is actually running — and
+    /// corrects anything that disagrees.
+    ///
+    /// This exists because "the camera is off while monitoring says it is on"
+    /// was reported three times with three unrelated causes: a failure path that
+    /// paused for the day, a retry ladder that gave up, and a missed unlock
+    /// notification that stranded `.locked` with every timer stopped. Each was
+    /// fixed where it happened, and the next one arrived somewhere else. The
+    /// pattern is the finding: recovery was attached to whichever code path
+    /// happened to stop the camera, so any path nobody anticipated had none.
+    ///
+    /// So this asks the two questions that matter — *should the camera be on,
+    /// and is it?* — without caring how it got that way. Remedies are delegated
+    /// to the existing paths so their backoff and lock-safety rules still apply;
+    /// this only detects.
+    private func superviseInvariants() {
+        let sessionLocked = ScreenLocker.sessionIsLocked
+
+        // A locked session with the screen unlocked, or vice versa. Both
+        // directions are driven by best-effort notifications, so both are
+        // re-derived here rather than trusted to arrive. (Each `where` binds to
+        // its own pattern — a shared one would apply to the last only.)
+        switch state {
+        case .locked where !sessionLocked:
+            resumeFromLocked()
+            return
+        case .watching where sessionLocked, .alerting where sessionLocked:
+            enterLockedState()
+            return
+        default:
+            break
+        }
+
+        // The camera must be running exactly while we are watching for someone.
+        // `.cameraUnavailable` is excluded deliberately: its retry ladder owns
+        // restarts, and starting one per second would hammer a device that is
+        // already failing. `.enrolling` is excluded because the enrollment
+        // controller owns the session while it configures.
+        guard state == .watching || isAlerting else { return }
+        let now = Uptime.now
+        // Judged on delivered frames, not on `session.isRunning`. The session is
+        // configured asynchronously, so it reads as not-running for the first
+        // moments of every start — supervising that directly would tear down the
+        // camera on startup. Frames are also the stronger signal: a session can
+        // report running while the driver has wedged and delivers nothing.
+        if cameraIsStale(now: now) {
+            handleCameraStopped(now: now)
+        }
+    }
+
     private func startTick(interval: TimeInterval) {
         stopTick()
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
@@ -632,13 +704,8 @@ final class MonitorCoordinator {
         switch state {
         case .watching:
             let now = Uptime.now
-            // Liveness is supervised continuously rather than checked once at
-            // startup: a session can die at any moment (another app seizes the
-            // device, the driver wedges after a wake) and nothing used to notice.
-            if cameraIsStale(now: now) {
-                handleCameraStopped(now: now)
-                return
-            }
+            // Camera liveness is not checked here — `superviseInvariants` owns
+            // it for every state, including the ones that stop this timer.
             // The alert fires off graceTimer, not this poll — this only picks the
             // sampling rate: faster once absence is actually suspected, cheaper
             // while the chain is healthy. Same anchor the deadline uses, so
