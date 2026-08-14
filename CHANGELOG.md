@@ -5,6 +5,74 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/).
 
+## [1.4.3] - 2026-08-14
+
+### Added
+
+- **Recognition telemetry.** Every analysed frame now records what it decided:
+  face and body counts, the best similarity score, the threshold it was compared
+  against, whether the face was *judgeable*, and its yaw and pitch against the
+  enrolled baseline.
+
+  The app has been making an identity decision every 0.25 s and keeping no record
+  of it, so every question about whether a threshold is right has been answered
+  by reasoning — and the reasoning has been wrong more than once. Two things
+  surfaced within minutes of switching it on: the owner scores ~0.61 in ordinary
+  seated use rather than the ~0.98 measured at enrollment, and a face scoring as
+  low as 0.05 can be reported as neither a match nor a stranger, because an
+  unjudgeable face sets no flag and therefore sustains presence indefinitely.
+
+  Logged at `info`, not `debug`: debug is never written to the persistent store,
+  so it can only be watched live, which is useless for a symptom reported an hour
+  later. `info` stays out of an ordinary `log show`, so a similarity score — not
+  identifying on its own, but biometric-adjacent — is still absent from a default
+  capture, while remaining readable on request:
+
+  ```sh
+  /usr/bin/log show --info --last 1h \
+    --predicate 'subsystem == "com.xavierloo.lockscreen-dah" AND category == "recognition"' \
+    --style compact
+  ```
+
+  No image data, no embeddings, no landmarks — angles and scores only.
+
+### Fixed
+
+- **The camera restarted in a loop, and twice locked the screen for no reason.**
+  Three compounding faults, all measured from the app's own log and the camera
+  daemon:
+
+  1. **The staleness bar was shorter than this Mac's camera cold start.** Opening
+     the device takes ~3.7 s of session configuration plus 4.03 s from the daemon
+     being asked to stream to frames actually flowing — ISP power-on alone is
+     1.8 s — against a 3 s bar. One teardown fired **0.66 s before the system had
+     even been asked to start streaming.** Startup and mid-stream staleness now
+     have separate allowances (15 s and 3 s); fusing them was the assumption that
+     broke.
+
+  2. **The liveness anchor was cleared asynchronously**, on a serial queue behind
+     session configuration and frame analysis, so a new session was judged
+     against the *previous* session's last-frame timestamp — already older than
+     any bar. **8 of 10 teardowns reported a frame gap larger than the session
+     had existed**, which is arithmetically impossible otherwise. It is now
+     invalidated synchronously before the work is dispatched. Introduced by the
+     supervisor added in 1.4.0.
+
+  3. **Results from a torn-down session reset the retry ladder.** Late results
+     still arrive after a teardown (measured 5.6 s), and clearing the failure
+     counter meant `[30, 60, 300]` never escalated — the log shows `retry 1 in
+     30s` seven times in a row, hammering a device that was already struggling.
+     The hardware recorded the collision: ten `ISP_PowerOnCamera … retrying`
+     errors, each adding ~1.4 s to the next start. The reset is now guarded by
+     the result's own capture time.
+
+  When a teardown landed during a countdown, the "absence was already proven"
+  branch locked the screen — so this was user-visible, not merely wasteful.
+
+  The rule now lives in `CameraLiveness`, a pure type with tests, rather than
+  three lines inside a coordinator no test could construct. Each of the three
+  faults was verified by reintroducing it and watching the suite fail.
+
 ## [1.4.2] - 2026-08-14
 
 ### Added

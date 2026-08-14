@@ -58,6 +58,15 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private let stateLock = NSLock()
     private var firstFrame: TimeInterval?
     private var lastFrame: TimeInterval?
+    /// When `startRunning()` actually returned for this session, or nil while the
+    /// session is still being configured (or is stopped).
+    ///
+    /// Distinct from "when the coordinator asked us to start" on purpose. Opening
+    /// the device is slow — device lookup, input creation, session configuration,
+    /// then the ISP powering on — measured at ~7.7 s end to end on an M1 Pro
+    /// built-in camera. Judging frame staleness against the request instant
+    /// declared the camera dead before the system had even been asked to stream.
+    private var streamingSince: TimeInterval?
     private var interval: TimeInterval = 1.5
     private var enrollmentMode = false
 
@@ -150,7 +159,7 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         session.outputs.forEach(session.removeOutput)
         session.commitConfiguration()
         configured = false
-        resetLiveness()
+        invalidateLiveness()
     }
 
     var analysisInterval: TimeInterval {
@@ -171,14 +180,24 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// AVFoundation does not support (black preview, or a thrown exception on
     /// the connection add).
     func start(completion: (() -> Void)? = nil) {
+        // Invalidated here, on the calling thread, rather than inside the block
+        // below. `queue` is serial and also carries frame analysis, so the async
+        // body runs behind configuration and any queued Vision/Core ML work —
+        // seconds. Until it ran, `lastFrameAt` still held the *previous*
+        // session's timestamp, which was already older than the staleness bar,
+        // so the 1 Hz supervisor tore the new session down within a tick of
+        // starting it. Measured: 8 of 10 teardowns reported a frame gap larger
+        // than the session had existed, and the retry loop could never escape.
+        let alreadyRunning = session.isRunning
+        if !alreadyRunning { invalidateLiveness() }
+
         queue.async {
             self.configureIfNeeded()
             if self.configured, !self.session.isRunning {
-                // Reset liveness only for a genuine (re)start, so an
-                // already-running session's proven frame delivery isn't
-                // discarded by a no-op call.
-                self.resetLiveness()
                 self.session.startRunning()
+                self.stateLock.lock()
+                self.streamingSince = Uptime.now
+                self.stateLock.unlock()
             }
             // Fires even when configuration failed, so a caller waiting to show
             // UI is never left hanging on a machine with no usable camera.
@@ -195,15 +214,25 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             // Liveness must not survive a stop: a stopped session has proven
             // nothing about the future, and leaving it set let the coordinator
             // read "camera is fine" while it was actually off.
-            self.resetLiveness()
+            self.invalidateLiveness()
         }
     }
 
-    private func resetLiveness() {
+    private func invalidateLiveness() {
         stateLock.lock()
         firstFrame = nil
         lastFrame = nil
+        streamingSince = nil
         stateLock.unlock()
+    }
+
+    /// When this session actually began streaming, or nil while it is still
+    /// opening the device. Nil means "no opinion yet" — the caller must not read
+    /// it as a stalled camera; see `MonitorCoordinator.cameraIsStale`.
+    var streamingSinceAt: TimeInterval? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return streamingSince
     }
 
     /// When the most recent frame arrived, or nil if none has since `start()`.
@@ -322,6 +351,16 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             bodyCount = humanRequest.results?.count ?? 0
         }
 
+        // -1 distinguishes "no face was scored at all" from a genuine 0.0 match.
+        var bestSimilarity: Float = -1
+        // Recorded alongside the score because a face that is *unjudgeable* sets
+        // neither the stranger nor the unconfirmed flag, and therefore sustains
+        // seat continuity indefinitely — so "why was this face not judged?" is a
+        // question the log has to be able to answer. A nil angle is meaningful:
+        // it is read as off-angle, deliberately.
+        var bestYaw: Float?
+        var bestPitch: Float?
+        var bestJudgeable = false
         var result = DetectionResult(
             faceCount: faces.count,
             bodyCount: bodyCount,
@@ -363,6 +402,12 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                     guard let embedding = recognizer.embedding(for: face, in: pixelBuffer),
                           let similarity = recognizer.similarityToOwner(embedding)
                     else { continue }
+                    if similarity > bestSimilarity {
+                        bestSimilarity = similarity
+                        bestYaw = face.yaw?.floatValue
+                        bestPitch = face.pitch?.floatValue
+                        bestJudgeable = isJudgeable(face)
+                    }
                     if similarity >= Settings.matchThreshold {
                         result.ownerMatched = true
                         break
@@ -381,6 +426,24 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                     }
                 }
             }
+        }
+
+        // Info level, not debug. Debug is never written to the persistent store,
+        // so it can only be watched live — which is useless for a symptom the
+        // user reports an hour later, and it wasted a capture attempt proving
+        // exactly that. Info stays out of an ordinary `log show`, so a score —
+        // not identifying on its own, but biometric-adjacent — still isn't in a
+        // default capture, yet it can be read back after the fact:
+        //   /usr/bin/log show --info --last 1h \
+        //     --predicate 'subsystem == "com.xavierloo.lockscreen-dah" AND category == "recognition"'
+        //
+        // It is recorded at all because whether the match threshold is too tight
+        // has so far been decided by reasoning, and the reasoning has been wrong
+        // twice.
+        if !enrollmentMode {
+            Log.recognition.info(
+                "faces=\(result.faceCount, privacy: .public) bodies=\(result.bodyCount, privacy: .public) best=\(bestSimilarity, format: .fixed(precision: 3), privacy: .public) bar=\(Settings.matchThreshold, format: .fixed(precision: 2), privacy: .public) matched=\(result.ownerMatched, privacy: .public) stranger=\(result.strangerSeen, privacy: .public) unconfirmed=\(result.frontalButUnmatched, privacy: .public) judgeable=\(bestJudgeable, privacy: .public) yaw=\(bestYaw.map { String(format: "%+.3f", $0) } ?? "nil", privacy: .public) pitch=\(bestPitch.map { String(format: "%+.3f", $0) } ?? "nil", privacy: .public) baseline=\(self.recognizer.baselinePitch, format: .fixed(precision: 3), privacy: .public)"
+            )
         }
 
         onResult?(result)

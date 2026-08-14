@@ -1,9 +1,9 @@
 # Testing & watch list
 
 `swift test` covers `PresenceTracker`, `Settings`, `MonitoringSchedule`,
-`EnrollmentStages` and `PresenceSupervisor` — the pure logic where every
-presence, timing, enrollment and lock/sleep bug in this project has actually
-lived. Everything below is
+`EnrollmentStages`, `PresenceSupervisor` and `CameraLiveness` — the pure logic
+where every presence, timing, enrollment, lock/sleep and camera-lifecycle bug in
+this project has actually lived. Everything below is
 what a test **can't** reach: it needs a real camera, a real face, and in a couple
 of cases a second person.
 
@@ -108,15 +108,31 @@ because the "has delivered a frame" flag was sticky.
 was the `screenIsUnlocked` notification — best-effort, so a single dropped one
 stranded the app with the screen unlocked and nothing running to notice.
 
+*Fourth:* the supervisor judged a **cold start** against the mid-stream frame-gap
+bar. Opening the device costs ~7.7 s on an M1 Pro built-in camera; the bar was
+3 s, so a fresh session was torn down before the system had even been asked to
+stream, retried, and torn down again. Two faults made the loop inescapable: the
+liveness anchor was cleared asynchronously, so each retry was judged against the
+*previous* session's clock (8 of 10 teardowns reported a frame gap larger than
+the session had existed), and late results from dead sessions reset the retry
+ladder so it never backed off. Twice the loop landed during a countdown and
+locked the screen. Startup and staleness now have separate allowances, and the
+rule lives in `CameraLiveness` with tests.
+
 Liveness is now a **continuously supervised invariant**, owned by a supervisor
 that runs for the life of the app at 1 Hz and is never stopped by a state
 transition — which is the point, since every previous cause was a transition
 that stopped the thing meant to notice. `FaceMonitor` records the instant of
-every frame; the supervisor asserts the gap is under 3 s, and separately that
-the session's lock state and the app's state still agree. Frames arrive at the
-sensor's own rate regardless of the analysis throttle, so a gap is unambiguous.
-One rule covers "never came up" and "died later", and the grace-expiry path
-shares it, so the two can't disagree.
+every frame, and when the session actually began streaming; the supervisor
+asserts the gap is under 3 s *once streaming*, and separately that the session's
+lock state and the app's state still agree. Frames arrive at the sensor's own
+rate regardless of the analysis throttle, so a gap is unambiguous.
+
+"Never came up" and "died later" are deliberately **no longer** one rule — that
+fusion is what produced the fourth cause above, because opening the device is far
+slower than any frame gap. `CameraLiveness` answers both, returning the gap
+*and* the bar it should be judged against, and the grace-expiry path shares it,
+so the two still can't disagree.
 
 Detection is centralised there; the **remedies** stay where they were, so the
 retry ladder's backoff and the "never lock on evidence gathered while blind"
@@ -137,6 +153,20 @@ it.
 struck-through camera icon, one alert after ~6 minutes, and **no permanent
 pause**. Quit Photo Booth and monitoring must resume on its own within 5 minutes,
 with no click.
+
+After any change touching camera lifecycle, also check the log for the loop's
+signature — a frame gap that exceeds the session's own age is impossible and
+means the anchor is stale again:
+
+```sh
+/usr/bin/log show --last 1h \
+  --predicate 'subsystem == "com.xavierloo.lockscreen-dah"' --style compact
+```
+
+Every `supervisor decided cameraStopped` line must show `sinceFrame` no larger
+than the wall-clock gap to the `starting capture` above it, and `retry 1 in 30s`
+must never repeat — the ladder has to reach 60 s and 300 s. (`log` is a zsh
+builtin; the full path matters.)
 
 ### 5. Main-thread stalls delay the lock
 

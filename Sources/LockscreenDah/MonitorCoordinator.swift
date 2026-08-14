@@ -80,11 +80,26 @@ final class MonitorCoordinator {
     /// yet" then means "too early to tell", not "camera broken" — see
     /// `handleGraceExpired`.
     private var cameraStartedAt = -Double.infinity
-    /// A frame gap longer than this means the pipeline has stopped. Frames arrive
-    /// at the sensor's rate no matter how coarse the analysis throttle is, so
-    /// this is unambiguous — and it doubles as the startup allowance, since
-    /// "never delivered a frame" is just the same gap measured from the start.
+    /// A frame gap longer than this means a *running* pipeline has stopped.
+    /// Frames arrive at the sensor's rate no matter how coarse the analysis
+    /// throttle is, so this is unambiguous.
+    ///
+    /// It deliberately no longer doubles as the startup allowance. Fusing the two
+    /// is what produced a restart loop: opening the device is far slower than a
+    /// frame gap ever is, so a cold start was judged against a bar it could not
+    /// meet, torn down, retried, and torn down again.
     private let cameraStaleAfter: TimeInterval = 3
+    /// How long the device may take to produce its first frame before we call it
+    /// broken.
+    ///
+    /// Measured on an M1 Pro built-in camera: ~3.7 s of session configuration,
+    /// then 4.03 s from the daemon being asked to stream to frames actually
+    /// flowing (ISP power-on alone is 1.8 s), and a worst observed first result
+    /// of 19.85 s under contention. Against the 3 s bar the app declared the
+    /// camera dead *0.66 s before the system had even been asked to stream*.
+    /// Bounded rather than unlimited, so a device that never comes up is still
+    /// caught — just not before it has had a fair chance.
+    private let cameraStartupAllowance: TimeInterval = 15
     /// Consecutive failures to start the camera. Any delivered frame clears it.
     /// When the current capture session first produced an analysis result, as
     /// opposed to a frame. Nil until then; see `graceAnchor`.
@@ -286,8 +301,24 @@ final class MonitorCoordinator {
     /// True when the capture pipeline has stopped delivering. Measured from the
     /// last frame, or from the start when none has arrived — one rule covering
     /// both "never came up" and "died later".
+    /// Delegates to `CameraLiveness`, which is pure and therefore testable —
+    /// this rule previously lived here, where no test could reach it, and shipped
+    /// a restart loop. One helper because two callers ask the question (the
+    /// supervisor and the grace-expiry path), and a rule duplicated across both
+    /// is a rule that eventually disagrees with itself.
+    private func cameraLiveness(now: TimeInterval) -> CameraLiveness.Reading {
+        CameraLiveness.evaluate(
+            now: now,
+            requestedAt: cameraStartedAt,
+            streamingSince: monitor.streamingSinceAt,
+            lastFrameAt: monitor.lastFrameAt,
+            staleAfter: cameraStaleAfter,
+            startupAllowance: cameraStartupAllowance
+        )
+    }
+
     private func cameraIsStale(now: TimeInterval) -> Bool {
-        now - (monitor.lastFrameAt ?? cameraStartedAt) > cameraStaleAfter
+        cameraLiveness(now: now).isStale
     }
 
     private var isAlerting: Bool {
@@ -495,9 +526,16 @@ final class MonitorCoordinator {
     // MARK: - Detection handling
 
     private func handleDetection(_ result: DetectionResult) {
-        // Frames are arriving; the camera is demonstrably fine.
-        cameraFailures = 0
-        cameraFailureAnnounced = false
+        // Frames are arriving; the camera is demonstrably fine — but only if this
+        // result belongs to the *current* session. Results from an already torn
+        // down session still arrive (measured 5.6 s after teardown), and letting
+        // one clear the counter meant the backoff never escalated: the log showed
+        // "retry 1 in 30s" seven times in a row while the ladder [30, 60, 300]
+        // sat unused, hammering a device that was already struggling.
+        if result.capturedAt >= cameraStartedAt {
+            cameraFailures = 0
+            cameraFailureAnnounced = false
+        }
         if firstResultAt == nil {
             firstResultAt = Uptime.now
             Log.camera.notice("first analysis result \(self.firstResultAt! - self.cameraStartedAt, format: .fixed(precision: 2), privacy: .public)s after start")
@@ -588,21 +626,25 @@ final class MonitorCoordinator {
     /// separate path with its own rules.
     private func superviseInvariants() {
         let now = Uptime.now
+        // Both halves come from one helper: the bar varies with whether the
+        // session is streaming yet, and passing a gap measured one way against a
+        // bar meant for the other is the whole bug this replaced.
+        let liveness = cameraLiveness(now: now)
         let decision = PresenceSupervisor.decide(
             state: supervisedState,
             conditions: SystemConditions(
                 sessionLocked: ScreenLocker.sessionIsLocked,
                 displayAsleep: ScreenLocker.displayIsAsleep,
-                secondsSinceLastFrame: now - (monitor.lastFrameAt ?? cameraStartedAt),
+                secondsSinceLastFrame: liveness.gap,
                 secondsSinceOwnerSeen: now - graceAnchor
             ),
             gracePeriod: Settings.gracePeriod,
-            staleAfter: cameraStaleAfter
+            staleAfter: liveness.bar
         )
         if decision != .doNothing {
             // The conditions, not just the outcome: which fact drove it is the
             // whole question when a camera is unexpectedly off.
-            Log.state.notice("supervisor decided \(String(describing: decision), privacy: .public) in \(self.state.logName, privacy: .public): sessionLocked=\(ScreenLocker.sessionIsLocked, privacy: .public) displayAsleep=\(ScreenLocker.displayIsAsleep, privacy: .public) sinceFrame=\(now - (self.monitor.lastFrameAt ?? self.cameraStartedAt), format: .fixed(precision: 1), privacy: .public)s")
+            Log.state.notice("supervisor decided \(String(describing: decision), privacy: .public) in \(self.state.logName, privacy: .public): sessionLocked=\(ScreenLocker.sessionIsLocked, privacy: .public) displayAsleep=\(ScreenLocker.displayIsAsleep, privacy: .public) sinceFrame=\(liveness.gap, format: .fixed(precision: 1), privacy: .public)s bar=\(liveness.bar, format: .fixed(precision: 0), privacy: .public)s streaming=\(self.monitor.streamingSinceAt != nil, privacy: .public)")
         }
         switch decision {
         case .doNothing: break
