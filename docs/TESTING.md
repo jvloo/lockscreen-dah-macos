@@ -1,8 +1,9 @@
 # Testing & watch list
 
-`swift test` covers `PresenceTracker`, `Settings`, `MonitoringSchedule` and
-`EnrollmentStages` — the pure logic where every presence, timing and enrollment
-bug in this project has actually lived. Everything below is
+`swift test` covers `PresenceTracker`, `Settings`, `MonitoringSchedule`,
+`EnrollmentStages` and `PresenceSupervisor` — the pure logic where every
+presence, timing, enrollment and lock/sleep bug in this project has actually
+lived. Everything below is
 what a test **can't** reach: it needs a real camera, a real face, and in a couple
 of cases a second person.
 

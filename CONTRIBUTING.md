@@ -39,8 +39,8 @@ with Hardened Runtime. See `Package.swift` and `build.sh`.
 swift test
 ```
 
-`PresenceTracker`, `Settings`, `MonitoringSchedule` and `EnrollmentStages` are pure types with no AppKit or camera dependency, and they're where every presence,
-timing and enrollment bug in this project has actually lived — so they're covered directly.
+`PresenceTracker`, `Settings`, `MonitoringSchedule`, `EnrollmentStages` and `PresenceSupervisor` are pure types with no AppKit or camera dependency, and they're where every presence,
+timing, enrollment and lock/sleep bug in this project has actually lived — so they're covered directly.
 If you change the presence chain, the duration clamps, the schedule maths, or an enrollment pose gate, **add or update a test there**; several past bugs were
 the fix for an earlier bug, which is exactly what these catch.
 
@@ -58,6 +58,11 @@ so verify those by running it:
 
 - `./build.sh --install` and exercise the affected flow end-to-end from the
   menu bar.
+- `MonitorCoordinator` keeps the AppKit machinery, but the *decisions* it makes
+  about locking, resuming and camera liveness belong in `PresenceSupervisor`,
+  which is pure. Put new decision rules there — three shipped bugs came from
+  logic that lived in the coordinator where no test could reach it, and each was
+  a one-line assertion once moved out.
 - For anything touching `MonitorCoordinator`'s state machine, walk through the
   actual state transitions rather than trusting a read-through — this logic is
   easy to get subtly wrong around lock/unlock, sleep, and camera rest, and past

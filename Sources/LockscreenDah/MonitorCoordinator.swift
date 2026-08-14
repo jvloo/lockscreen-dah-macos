@@ -546,42 +546,41 @@ final class MonitorCoordinator {
     /// and is it?* — without caring how it got that way. Remedies are delegated
     /// to the existing paths so their backoff and lock-safety rules still apply;
     /// this only detects.
-    private func superviseInvariants() {
-        let sessionLocked = ScreenLocker.sessionIsLocked
-
-        // A locked session with the screen unlocked, or vice versa. Both
-        // directions are driven by best-effort notifications, so both are
-        // re-derived here rather than trusted to arrive. (Each `where` binds to
-        // its own pattern — a shared one would apply to the last only.)
+    /// The state, reduced to what a decision depends on.
+    private var supervisedState: SupervisedState {
         switch state {
-        // `.locked` covers two unrelated situations — the session locked, or
-        // the display slept without locking — and only the first is undone by
-        // an unlock. Reading a sleeping display as a missed unlock notification
-        // would restart the camera behind a dark screen every display sleep.
-        case .locked where !sessionLocked && !ScreenLocker.displayIsAsleep:
-            resumeFromLocked()
-            return
-        case .watching where sessionLocked, .alerting where sessionLocked:
-            enterLockedState()
-            return
-        default:
-            break
+        case .paused: return .paused
+        case .watching: return .watching
+        case .alerting: return .alerting
+        case .locked: return .locked
+        case .enrolling: return .enrolling
+        case .cameraUnavailable: return .cameraUnavailable
         }
+    }
 
-        // The camera must be running exactly while we are watching for someone.
-        // `.cameraUnavailable` is excluded deliberately: its retry ladder owns
-        // restarts, and starting one per second would hammer a device that is
-        // already failing. `.enrolling` is excluded because the enrollment
-        // controller owns the session while it configures.
-        guard state == .watching || isAlerting else { return }
+    /// Re-derives what should be true and corrects whatever disagrees. Called
+    /// on a fixed cadence *and* from every lock/sleep notification, so the two
+    /// cannot drift apart — a notification is a prompt to re-decide, never a
+    /// separate path with its own rules.
+    private func superviseInvariants() {
         let now = Uptime.now
-        // Judged on delivered frames, not on `session.isRunning`. The session is
-        // configured asynchronously, so it reads as not-running for the first
-        // moments of every start — supervising that directly would tear down the
-        // camera on startup. Frames are also the stronger signal: a session can
-        // report running while the driver has wedged and delivers nothing.
-        if cameraIsStale(now: now) {
-            handleCameraStopped(now: now)
+        let decision = PresenceSupervisor.decide(
+            state: supervisedState,
+            conditions: SystemConditions(
+                sessionLocked: ScreenLocker.sessionIsLocked,
+                displayAsleep: ScreenLocker.displayIsAsleep,
+                secondsSinceLastFrame: now - (monitor.lastFrameAt ?? cameraStartedAt),
+                secondsSinceOwnerSeen: now - graceAnchor
+            ),
+            gracePeriod: Settings.gracePeriod,
+            staleAfter: cameraStaleAfter
+        )
+        switch decision {
+        case .doNothing: break
+        case .resumeFromLocked: resumeFromLocked()
+        case .enterLocked: enterLockedState()
+        case .cameraStopped: handleCameraStopped(now: now)
+        case .lockNow: lockNow()
         }
     }
 
@@ -861,19 +860,20 @@ final class MonitorCoordinator {
 
     private func observeLockAndSleepEvents() {
         let distributed = DistributedNotificationCenter.default()
+        // Each of these only prompts an immediate re-decision. The supervisor
+        // would reach the same conclusion within a second anyway; the
+        // notification just removes the delay, and cannot disagree with it.
         distributed.addObserver(
             forName: Notification.Name("com.apple.screenIsLocked"),
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, self.state != .paused, self.state != .enrolling,
-                  self.state != .cameraUnavailable else { return }
-            self.enterLockedState()
+            self?.superviseInvariants()
         }
         distributed.addObserver(
             forName: Notification.Name("com.apple.screenIsUnlocked"),
             object: nil, queue: .main
         ) { [weak self] _ in
-            self?.resumeFromLocked()
+            self?.superviseInvariants()
         }
 
         let workspace = NSWorkspace.shared.notificationCenter
@@ -881,30 +881,14 @@ final class MonitorCoordinator {
             forName: NSWorkspace.screensDidSleepNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, self.state != .paused, self.state != .enrolling,
-                  self.state != .cameraUnavailable else { return }
-            // A lock that was already decided must not be dropped just because
-            // the display went dark. Parking in .locked without locking leaves
-            // the machine unlocked behind a black screen, protected only by
-            // whatever "require password after sleep" setting the user happens
-            // to have — which this app neither sets nor reads.
-            //
-            // Same rule the blind-camera path uses: absence proven *before* we
-            // stopped being able to see it is real evidence. A countdown in
-            // flight is exactly that, and its remaining seconds buy the user
-            // nothing once the screen they would have read them on is off.
-            if self.isAlerting || Uptime.now - self.graceAnchor >= Settings.gracePeriod {
-                self.lockNow()
-                return
-            }
-            self.enterLockedState()
+            self?.superviseInvariants()
         }
         workspace.addObserver(
             forName: NSWorkspace.screensDidWakeNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
             // Display woke without a password unlock (e.g. lock screen disabled).
-            self?.resumeFromLocked()
+            self?.superviseInvariants()
         }
         workspace.addObserver(
             forName: NSWorkspace.didWakeNotification,
