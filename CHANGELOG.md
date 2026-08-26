@@ -5,6 +5,46 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-08-26
+
+### Added
+
+- **Local recognition-model evaluation.** An opt-in CLI harness compares the
+  bundled MobileFaceNet model with an optional user-provided R50 Core ML model
+  through production alignment and inference. It reports aggregate identity
+  outcomes, latency, model and manifest fingerprints, and hardware context
+  without saving a profile, images, or embeddings. Production remains pinned
+  to bundled MobileFaceNet.
+
+### Changed
+
+- **Re-enrollment now creates a v3 pose-specific profile.** Each completed pose
+  contributes one template instead of also creating a cross-pose mean. When
+  every capture in a pose has a finite Vision capture-quality score, only a
+  unique weakest frame is omitted. Capture quality ranks nearby enrollment
+  frames; it is not liveness detection.
+- Model conversion verifies cached `w600k_mbf.onnx`, honors `MODEL_WORK_DIR`,
+  pins the locally tested converter packages, and documents pretrained-weight
+  licensing separately from the app's MIT source license.
+
+### Fixed
+
+- **Frames without verdicts can no longer look healthy forever.** First analysis
+  has a measured 25-second allowance, covering the observed 19.85-second
+  startup; later result gaps are bounded independently of frame delivery. A
+  stall enters recovery, and blind time is not evidence of absence.
+- **Hung Vision/Core ML work can no longer strand capture recovery.** Session
+  mutations remain serialized on their own queue, while every capture
+  generation owns its delegate queue, Vision requests, throttle state, and
+  inference scratch. Invalidated generations cannot update liveness, reset
+  retry state, or cancel a countdown.
+
+### Upgrading
+
+Settings and existing v2 profiles carry over unchanged. Re-enroll to create a
+v3 profile. This remains presence monitoring, not authentication or
+presentation-attack detection.
+
 ## [1.4.3] - 2026-08-14
 
 ### Added
@@ -697,7 +737,12 @@ new Instant option added. Timings below were measured, not estimated.
 See the [Security audit](README.md#security-audit) section in the README for
 the full findings list.
 
-[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/jvloo/lockscreen-dah-macos/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.5.0
+[1.4.3]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.4.3
+[1.4.2]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.4.2
+[1.4.1]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.4.1
+[1.4.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.4.0
 [1.3.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.3.0
 [1.2.0]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.2.0
 [1.1.2]: https://github.com/jvloo/lockscreen-dah-macos/releases/tag/v1.1.2
