@@ -12,10 +12,22 @@ struct EnrollmentSample {
     /// tips their head becomes their tilted bucket without the code having to
     /// know which way Vision counts as positive.
     let pitch: Float
+    /// Vision's capture-quality score, when the enrollment-only quality request
+    /// produced one. It is used only to rank captures from the same pose; the
+    /// score is not a liveness signal and has no global pass/fail threshold.
+    let captureQuality: Float?
+
+    init(embedding: [Float], yaw: Float, pitch: Float, captureQuality: Float? = nil) {
+        self.embedding = embedding
+        self.yaw = yaw
+        self.pitch = pitch
+        self.captureQuality = captureQuality
+    }
 }
 
-/// v2 profile: multiple pose templates (overall + center/left/right buckets)
-/// built from a staged enrollment. v1 single-embedding profiles are ignored —
+/// v3 profiles contain one template per completed enrollment pose. Existing v2
+/// profiles remain readable and keep their original template set; v1
+/// single-embedding profiles are ignored —
 /// they were computed from unaligned crops and don't compare to aligned ones.
 struct FaceProfile: Codable {
     var version: Int
@@ -40,13 +52,12 @@ struct FaceProfile: Codable {
 /// degrades to presence-only (any face counts as the owner).
 final class FaceRecognizer {
     static let embeddingSize = 112
+    static let embeddingDimensions = 512
+    static let poseProfileVersion = 3
     /// How far from the user's *resting* pitch counts as tilted (radians, ~14°).
     /// Relative, not absolute: measured resting pitch is ~0.2 on a laptop and
     /// differs per desk, so an absolute bar would reject a straight-ahead pose on
-    /// one setup and accept a barely-tilted one on another. Shared by the
-    /// enrollment stage gate and the bucket so they can't disagree — a stage that
-    /// accepts samples the bucket then rejects would pass enrollment while
-    /// silently improving nothing.
+    /// one setup and accept a barely-tilted one on another.
     static let tiltedPitch: Float = 0.25
     /// A turn far enough to be a distinct pose. Measured: a deliberate "slight"
     /// turn reaches only ~0.15 rad, so an 0.15 gate rejects real turns — which is
@@ -58,12 +69,36 @@ final class FaceRecognizer {
     private static let canonicalLeftEye = CGPoint(x: 38.2946, y: 112 - 51.6963)
     private static let canonicalRightEye = CGPoint(x: 73.5318, y: 112 - 51.5014)
 
-    private let model: MLModel?
-    private let inputName: String
-    private let outputName: String
-    private let ciContext = CIContext(options: [.cacheIntermediates: false])
-    private let deviceRGB = CGColorSpaceCreateDeviceRGB()
-    private var cropBuffer: CVPixelBuffer?
+    private let modelURL: URL?
+    private let modelCanLoad: Bool
+    /// Mutable inference scratch belongs to one capture generation. Recovery can
+    /// abandon a permanently hung generation and start another without the old
+    /// and new callbacks racing on a shared Core Image context or crop buffer.
+    final class InferenceContext {
+        private let modelURL: URL?
+        /// Loaded lazily on this generation's analysis queue. Model creation can
+        /// itself be expensive; doing it on the session-control queue would put
+        /// recovery back behind inference work by another route.
+        fileprivate lazy var model: MLModel? = {
+            guard let modelURL else { return nil }
+            let configuration = MLModelConfiguration()
+            configuration.computeUnits = .all
+            return try? MLModel(contentsOf: modelURL, configuration: configuration)
+        }()
+        fileprivate var inputName: String {
+            model?.modelDescription.inputDescriptionsByName.keys.first ?? "input"
+        }
+        fileprivate var outputName: String {
+            model?.modelDescription.outputDescriptionsByName.keys.first ?? "output"
+        }
+        fileprivate let ciContext = CIContext(options: [.cacheIntermediates: false])
+        fileprivate let deviceRGB = CGColorSpaceCreateDeviceRGB()
+        fileprivate var cropBuffer: CVPixelBuffer?
+
+        fileprivate init(modelURL: URL?) {
+            self.modelURL = modelURL
+        }
+    }
     /// What the last profile build scored, so a threshold can be chosen from
     /// evidence rather than intuition. Every threshold in this app was picked by
     /// reasoning; the scores were computed and thrown away.
@@ -85,20 +120,34 @@ final class FaceRecognizer {
         return directory.appendingPathComponent("profile.json")
     }()
 
-    init() {
-        if let url = Bundle.main.url(forResource: "FaceEmbedding", withExtension: "mlmodelc") {
-            let configuration = MLModelConfiguration()
-            configuration.computeUnits = .all
-            model = try? MLModel(contentsOf: url, configuration: configuration)
-        } else {
-            model = nil
-        }
-        inputName = model?.modelDescription.inputDescriptionsByName.keys.first ?? "input"
-        outputName = model?.modelDescription.outputDescriptionsByName.keys.first ?? "output"
-        _profile = Self.loadProfile()
+    convenience init() {
+        self.init(
+            modelURL: Bundle.main.url(forResource: "FaceEmbedding", withExtension: "mlmodelc"),
+            profile: Self.loadProfile()
+        )
     }
 
-    var hasModel: Bool { model != nil }
+    /// Explicit model injection is reserved for the local evaluator. Production
+    /// always calls `init()` above and therefore remains pinned to the bundled
+    /// MobileFaceNet resource; supplying an R50 here cannot silently change the
+    /// monitoring model or the persisted profile.
+    init(modelURL url: URL?, profile: FaceProfile?) {
+        modelURL = url
+        if let url {
+            let configuration = MLModelConfiguration()
+            configuration.computeUnits = .all
+            modelCanLoad = (try? MLModel(contentsOf: url, configuration: configuration)) != nil
+        } else {
+            modelCanLoad = false
+        }
+        _profile = profile
+    }
+
+    var hasModel: Bool { modelCanLoad }
+
+    func makeInferenceContext() -> InferenceContext {
+        InferenceContext(modelURL: modelCanLoad ? modelURL : nil)
+    }
 
     var hasProfile: Bool {
         profileLock.lock(); defer { profileLock.unlock() }
@@ -131,33 +180,39 @@ final class FaceRecognizer {
     /// Aligns the observed face to the canonical eye positions (falling back
     /// to a plain bounding-box crop when landmarks fail), then runs the
     /// embedding model. Returns an L2-normalized embedding.
-    func embedding(for face: VNFaceObservation, in pixelBuffer: CVPixelBuffer) -> [Float]? {
-        guard let model else { return nil }
+    func embedding(
+        for face: VNFaceObservation,
+        in pixelBuffer: CVPixelBuffer,
+        context: InferenceContext
+    ) -> [Float]? {
+        guard let model = context.model else { return nil }
         guard let faceImage = alignedFaceImage(for: face, in: pixelBuffer)
             ?? croppedFaceImage(for: face, in: pixelBuffer)
         else { return nil }
 
         let target = CGFloat(Self.embeddingSize)
-        guard let crop = reusableCropBuffer() else { return nil }
-        ciContext.render(
+        guard let crop = reusableCropBuffer(in: context) else { return nil }
+        context.ciContext.render(
             faceImage,
             to: crop,
             bounds: CGRect(x: 0, y: 0, width: target, height: target),
-            colorSpace: deviceRGB
+            colorSpace: context.deviceRGB
         )
 
         guard
             let input = try? MLDictionaryFeatureProvider(dictionary: [
-                inputName: MLFeatureValue(pixelBuffer: crop)
+                context.inputName: MLFeatureValue(pixelBuffer: crop)
             ]),
             let output = try? model.prediction(from: input),
-            let array = output.featureValue(for: outputName)?.multiArrayValue
+            let array = output.featureValue(for: context.outputName)?.multiArrayValue,
+            array.count == Self.embeddingDimensions
         else { return nil }
 
         var values = [Float](repeating: 0, count: array.count)
         for index in 0..<array.count {
             values[index] = array[index].floatValue
         }
+        guard values.allSatisfy(\.isFinite) else { return nil }
         return Self.normalized(values)
     }
 
@@ -238,8 +293,8 @@ final class FaceRecognizer {
         return CGPoint(x: sum.x / CGFloat(points.count), y: sum.y / CGFloat(points.count))
     }
 
-    private func reusableCropBuffer() -> CVPixelBuffer? {
-        if let cropBuffer { return cropBuffer }
+    private func reusableCropBuffer(in context: InferenceContext) -> CVPixelBuffer? {
+        if let cropBuffer = context.cropBuffer { return cropBuffer }
         var buffer: CVPixelBuffer?
         CVPixelBufferCreate(
             kCFAllocatorDefault,
@@ -249,88 +304,103 @@ final class FaceRecognizer {
             [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
             &buffer
         )
-        cropBuffer = buffer
+        context.cropBuffer = buffer
         return buffer
     }
 
     // MARK: - Enrollment profile
 
-    /// Builds pose templates from the staged enrollment samples (overall mean
-    /// plus per-pose means bucketed by yaw) and self-checks that the samples
-    /// actually match their own profile. Nothing is persisted — the caller
-    /// verifies live against the candidate, then `commit`s it.
-    /// Builds the template set and resting pitch for a group of samples.
-    /// Separated out so enrollment can rebuild it with one sample held back, to
-    /// score that sample against templates it did not contribute to.
-    private static func buildTemplates(
-        from samples: [EnrollmentSample], dimensions: Int
+    /// Builds exactly one template from each completed pose. The controller has
+    /// already proved that every group satisfied its stage gate, so inferring
+    /// poses again from noisy yaw/pitch values only loses information. It also
+    /// avoids the former cross-pose mean, which broadened max-cosine acceptance
+    /// by averaging incompatible views into one template.
+    ///
+    /// When every capture in a pose has a Vision quality score, the lowest one
+    /// is omitted from that pose's mean. Capture quality is only comparable
+    /// within this small burst; no global threshold is assumed. Missing quality
+    /// preserves the old all-samples behavior.
+    static func buildPoseTemplates(
+        from poseSamples: [[EnrollmentSample]], dimensions: Int
     ) -> ([[Float]], Float) {
-        // The overall mean goes in first, but note it gets *less* discriminative
-        // as pose coverage grows — averaging across level and tilted faces blurs
-        // it, and a blurry template is exactly the kind that accepts strangers.
-        // It earns its place while buckets may be too sparse to form; if pose
-        // coverage becomes reliable it is the first template to reconsider.
-        var templates: [[Float]] = [mean(of: samples.map(\.embedding), dimensions: dimensions)]
-
-        // Tilt is bucketed *before* yaw and removed from it. A head tipped down
-        // and slightly left belongs in one bucket, not smeared across two —
-        // mixing poses inside a bucket produces the same blurry mean as above.
-        // Baseline comes from the least-tilted samples, which are the
-        // straight-ahead ones — the pose the first stage asks for.
-        let sortedByTilt = samples.map(\.pitch).sorted { abs($0) < abs($1) }
-        let restingCount = max(1, sortedByTilt.count / 3)
-        let restingPitch = sortedByTilt.prefix(restingCount).reduce(0, +) / Float(restingCount)
-        let tilted = samples.filter { abs($0.pitch - restingPitch) > tiltedPitch }
-        let level = samples.filter { abs($0.pitch - restingPitch) <= tiltedPitch }
-        let buckets: [(String, [EnrollmentSample])] = [
-            ("tilted", tilted),
-            // Named for readability only — which physical direction each sign
-            // corresponds to is never assumed. All that matters is that the two
-            // turns land in different buckets. Uses the same threshold the stage
-            // gate does, so a sample a stage accepted can't fail to bucket.
-            ("center", level.filter { abs($0.yaw) < turnedYaw }),
-            ("turnedOneWay", level.filter { $0.yaw <= -turnedYaw }),
-            ("turnedOtherWay", level.filter { $0.yaw >= turnedYaw }),
-        ]
-        for (_, bucket) in buckets where bucket.count >= 2 {
-            templates.append(mean(of: bucket.map(\.embedding), dimensions: dimensions))
+        let groups = poseSamples.filter { !$0.isEmpty }
+        let templates = groups.map { group in
+            let ranked: [EnrollmentSample]
+            let qualities = group.compactMap(\.captureQuality)
+            if group.count >= 3,
+               qualities.count == group.count,
+               qualities.allSatisfy(\.isFinite),
+               let minimum = qualities.min(),
+               let maximum = qualities.max(),
+               maximum > minimum,
+               qualities.filter({ $0 == minimum }).count == 1,
+               let lowestIndex = qualities.firstIndex(of: minimum) {
+                ranked = group.enumerated().compactMap { index, sample in
+                    index == lowestIndex ? nil : sample
+                }
+            } else {
+                ranked = group
+            }
+            return mean(of: ranked.map(\.embedding), dimensions: dimensions)
         }
+        let resting = groups.first ?? []
+        let restingPitch = resting.isEmpty
+            ? 0
+            : resting.reduce(0) { $0 + $1.pitch } / Float(resting.count)
         return (templates, restingPitch)
     }
 
-    func makeCandidateProfile(samples: [EnrollmentSample]) throws -> FaceProfile {
+    func makeCandidateProfile(poseSamples: [[EnrollmentSample]]) throws -> FaceProfile {
+        let samples = poseSamples.flatMap { $0 }
         guard let dimensions = samples.first?.embedding.count, dimensions > 0 else {
             throw enrollmentError("No enrollment samples captured.")
         }
+        guard poseSamples.allSatisfy({ $0.count >= 2 }),
+              dimensions == Self.embeddingDimensions,
+              samples.allSatisfy({
+                  $0.embedding.count == dimensions && $0.embedding.allSatisfy(\.isFinite)
+              })
+        else {
+            throw enrollmentError("Enrollment poses were incomplete or incompatible.")
+        }
 
-        // The overall mean goes in first, but note it gets *less* discriminative
-        // as pose coverage grows — averaging across level and tilted faces blurs
-        // it, and a blurry template is exactly the kind that accepts strangers.
-        // It earns its place while buckets may be too sparse to form; if pose
-        // coverage becomes reliable it is the first template to reconsider.
-        let (templates, restingPitch) = Self.buildTemplates(from: samples, dimensions: dimensions)
+        let (templates, restingPitch) = Self.buildPoseTemplates(
+            from: poseSamples, dimensions: dimensions
+        )
 
         // Self-check (guards against a corrupted enrollment locking the user
         // out repeatedly): every capture should strongly match the profile it
         // just produced.
         let profile = FaceProfile(
-            version: 2, createdAt: Date(), templates: templates, baselinePitch: restingPitch
+            version: Self.poseProfileVersion,
+            createdAt: Date(),
+            templates: templates,
+            baselinePitch: restingPitch
         )
         // Scored leave-one-out: each sample is measured against templates built
         // from the *other* samples. Scoring a sample against a profile it helped
         // build flatters it — the template partly is that sample — and these
         // numbers are what a decision to tighten `matchThreshold` rests on, so
         // the bias was live: it reads as headroom that doesn't exist.
-        let similarities = samples.indices.map { index in
-            var others = samples
-            others.remove(at: index)
-            let (heldOut, baseline) = Self.buildTemplates(from: others, dimensions: dimensions)
-            return similarity(
-                of: samples[index].embedding,
-                to: FaceProfile(version: 2, createdAt: profile.createdAt,
-                                templates: heldOut, baselinePitch: baseline)
-            )
+        let poseSimilarities = poseSamples.indices.map { poseIndex in
+            poseSamples[poseIndex].indices.map { sampleIndex in
+                var heldOutGroups = poseSamples
+                let sample = heldOutGroups[poseIndex].remove(at: sampleIndex)
+                let (heldOut, baseline) = Self.buildPoseTemplates(
+                    from: heldOutGroups, dimensions: dimensions
+                )
+                return similarity(
+                    of: sample.embedding,
+                    to: FaceProfile(
+                        version: Self.poseProfileVersion,
+                        createdAt: profile.createdAt,
+                        templates: heldOut,
+                        baselinePitch: baseline
+                    )
+                )
+            }
         }
+        let similarities = poseSimilarities.flatMap { $0 }
         // The *worst* pose is what decides whether the live threshold is safe to
         // tighten — a good mean can hide one pose scoring near the bar, which is
         // precisely the case that produces false countdowns in normal use.
@@ -339,10 +409,13 @@ final class FaceRecognizer {
             mean: similarities.reduce(0, +) / Float(similarities.count),
             templates: templates.count
         )
+        let poseMeans = poseSimilarities.map { scores in
+            scores.reduce(0, +) / Float(scores.count)
+        }
         let meanSimilarity = similarities.reduce(0, +) / Float(similarities.count)
-        guard meanSimilarity >= 0.5 else {
+        guard poseMeans.allSatisfy({ $0 >= 0.5 }) else {
             throw enrollmentError(
-                "Captures were too inconsistent (score \(String(format: "%.2f", meanSimilarity))). Try again with better lighting."
+                "A captured pose was too inconsistent (overall score \(String(format: "%.2f", meanSimilarity))). Try again with better lighting."
             )
         }
 

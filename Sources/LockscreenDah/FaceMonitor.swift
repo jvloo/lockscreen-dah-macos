@@ -30,6 +30,41 @@ struct DetectionResult {
     var capturedAt: TimeInterval
 }
 
+/// Pure generation fence used under `FaceMonitor.stateLock`. Kept separate so
+/// the stale-result refusal is testable without constructing AVFoundation.
+struct CaptureGenerationGate {
+    private(set) var activeID: Int?
+
+    mutating func activate(_ id: Int) { activeID = id }
+    mutating func invalidate() { activeID = nil }
+    func accepts(_ id: Int) -> Bool { activeID == id }
+}
+
+/// Matches a capture-quality observation back to the rectangle observation
+/// used for pose gating and embedding. The two Vision requests may order or
+/// detect faces differently, so array position is not a safe association.
+enum FaceCaptureQualityMatcher {
+    static func quality(
+        for face: CGRect,
+        candidates: [(box: CGRect, quality: Float)],
+        minimumOverlap: CGFloat = 0.5
+    ) -> Float? {
+        let best = candidates.map { candidate in
+            (quality: candidate.quality, overlap: intersectionOverUnion(face, candidate.box))
+        }.max { $0.overlap < $1.overlap }
+        guard let best, best.overlap >= minimumOverlap else { return nil }
+        return best.quality
+    }
+
+    private static func intersectionOverUnion(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        guard !intersection.isNull, !intersection.isEmpty else { return 0 }
+        let intersectionArea = intersection.width * intersection.height
+        let unionArea = lhs.width * lhs.height + rhs.width * rhs.height - intersectionArea
+        return unionArea > 0 ? intersectionArea / unionArea : 0
+    }
+}
+
 /// Low-footprint webcam face watcher: 640x480 capture with Vision analysis
 /// throttled to `analysisInterval`, and the embedding model run only on frames
 /// where a face was actually detected.
@@ -37,22 +72,32 @@ struct DetectionResult {
 /// The analysis throttle is what bounds the cost. The sensor is *asked* for its
 /// slowest supported rate, but that request is not always honoured — see
 /// `configureIfNeeded` — so no particular frame rate should be assumed.
-final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+final class FaceMonitor: NSObject {
     /// Called on an internal queue for every analyzed frame.
-    var onResult: ((DetectionResult) -> Void)?
+    /// Carries the capture-generation ID with the result so the main-thread
+    /// consumer can revalidate it after its dispatch hop. Checking only here on
+    /// the analysis queue leaves a race where teardown can invalidate the
+    /// generation after the check but before the queued callback runs.
+    var onResult: ((Int, DetectionResult) -> Void)?
 
     private let recognizer: FaceRecognizer
     /// Exposed for the enrollment preview layer only.
     let session = AVCaptureSession()
-    private let output = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "com.xavierloo.lockscreen-dah.camera", qos: .utility)
+    /// Owns every AVCaptureSession/configuration mutation. Kept separate from
+    /// analysis so a Vision/Core ML call that never returns cannot strand stop,
+    /// teardown and every retry behind itself. AVFoundation session mutations
+    /// remain serialized with each other.
+    private let sessionQueue = DispatchQueue(
+        label: "com.xavierloo.lockscreen-dah.camera.session",
+        qos: .utility
+    )
     private var configured = false
-    // -infinity rather than 0: uptime starts near 0 at boot, and this must
-    // mean "never analyzed" so the first frame is always taken.
-    private var lastAnalysis = -Double.infinity
+    /// Session-queue-owned generation currently attached to `session`.
+    private var captureGeneration: CaptureGeneration?
+    private var nextGenerationID = 0
 
-    // Everything the main thread and the camera queue share, guarded by a lock
-    // rather than `queue.sync`: the camera queue runs Vision + Core ML, so a
+    // Everything the main thread and generation queues share, guarded by a lock
+    // rather than a sync hop: those queues run Vision + Core ML, so one
     // sync hop from main could stall the UI behind a whole frame analysis —
     // exactly the kind of stall that would blow the countdown's timing.
     private let stateLock = NSLock()
@@ -67,23 +112,62 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// built-in camera. Judging frame staleness against the request instant
     /// declared the camera dead before the system had even been asked to stream.
     private var streamingSince: TimeInterval?
+    /// Read by callback queues to reject frames and results from a generation
+    /// removed during recovery. Nil is set synchronously before teardown is
+    /// dispatched, so a late callback cannot resurrect stale liveness.
+    private var generationGate = CaptureGenerationGate()
     private var interval: TimeInterval = 1.5
     private var enrollmentMode = false
 
-    // Reused across frames (only touched on `queue`) — Vision request objects
-    // are stateless between perform calls; only the handler is per-buffer.
-    private let faceRequest: VNDetectFaceRectanglesRequest = {
-        let request = VNDetectFaceRectanglesRequest()
-        request.revision = VNDetectFaceRectanglesRequestRevision3
-        return request
-    }()
-    /// Upper-body detection keeps "present" true while the head is turned
-    /// toward another screen (a profile/back-of-head face may not detect).
-    private let humanRequest: VNDetectHumanRectanglesRequest = {
-        let request = VNDetectHumanRectanglesRequest()
-        request.upperBodyOnly = true
-        return request
-    }()
+    /// Everything that can be poisoned by one stuck Vision/Core ML call. A
+    /// rebuilt capture graph gets a fresh instance, including its own serial
+    /// delegate queue and mutable inference scratch. The old generation may stay
+    /// hung forever without blocking or sharing mutable state with the new one.
+    private final class CaptureGeneration: NSObject,
+        AVCaptureVideoDataOutputSampleBufferDelegate {
+        let id: Int
+        let output = AVCaptureVideoDataOutput()
+        let faceRequest: VNDetectFaceRectanglesRequest = {
+            let request = VNDetectFaceRectanglesRequest()
+            request.revision = VNDetectFaceRectanglesRequestRevision3
+            return request
+        }()
+        /// Enrollment-only request. Apple defines this as capture suitability,
+        /// not presentation-attack detection; its score is used only to rank
+        /// samples captured seconds apart in the same requested pose.
+        let faceQualityRequest = VNDetectFaceCaptureQualityRequest()
+        let humanRequest: VNDetectHumanRectanglesRequest = {
+            let request = VNDetectHumanRectanglesRequest()
+            request.upperBodyOnly = true
+            return request
+        }()
+        let inferenceContext: FaceRecognizer.InferenceContext
+        var lastAnalysis = -Double.infinity
+
+        private weak var owner: FaceMonitor?
+        private let queue: DispatchQueue
+
+        init(id: Int, owner: FaceMonitor) {
+            self.id = id
+            self.owner = owner
+            inferenceContext = owner.recognizer.makeInferenceContext()
+            queue = DispatchQueue(
+                label: "com.xavierloo.lockscreen-dah.camera.analysis.\(id)",
+                qos: .utility
+            )
+            super.init()
+            output.alwaysDiscardsLateVideoFrames = true
+            output.setSampleBufferDelegate(self, queue: queue)
+        }
+
+        func captureOutput(
+            _ output: AVCaptureOutput,
+            didOutput sampleBuffer: CMSampleBuffer,
+            from connection: AVCaptureConnection
+        ) {
+            owner?.captureOutput(sampleBuffer, from: self)
+        }
+    }
 
     /// Enrollment only accepts near-frontal samples (~45°) so the stored
     /// profile is clean; presence detection accepts any head angle.
@@ -144,20 +228,22 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         ) { [weak self] notification in
             let reason = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
             Log.camera.error("session runtime error: \(reason?.code ?? 0, privacy: .public); dropping configuration")
-            self?.queue.async { self?.teardownConfiguration() }
+            self?.invalidateLiveness()
+            self?.sessionQueue.async { self?.teardownConfiguration() }
         }
     }
 
     /// Returns the session to its pre-configuration state so a subsequent
     /// `start()` re-runs `configureIfNeeded()` against whatever device is
-    /// present now. Must run on `queue`.
+    /// present now. Must run on `sessionQueue`.
     private func teardownConfiguration() {
-        guard configured else { return }
         if session.isRunning { session.stopRunning() }
+        guard configured else { return }
         session.beginConfiguration()
         session.inputs.forEach(session.removeInput)
         session.outputs.forEach(session.removeOutput)
         session.commitConfiguration()
+        captureGeneration = nil
         configured = false
         invalidateLiveness()
     }
@@ -181,22 +267,26 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// the connection add).
     func start(completion: (() -> Void)? = nil) {
         // Invalidated here, on the calling thread, rather than inside the block
-        // below. `queue` is serial and also carries frame analysis, so the async
-        // body runs behind configuration and any queued Vision/Core ML work —
-        // seconds. Until it ran, `lastFrameAt` still held the *previous*
-        // session's timestamp, which was already older than the staleness bar,
-        // so the 1 Hz supervisor tore the new session down within a tick of
+        // below. Until sessionQueue runs, `lastFrameAt` may still hold the
+        // previous session's timestamp, already older than the staleness bar, so
+        // the 1 Hz supervisor could tear the new session down within a tick of
         // starting it. Measured: 8 of 10 teardowns reported a frame gap larger
         // than the session had existed, and the retry loop could never escape.
-        let alreadyRunning = session.isRunning
-        if !alreadyRunning { invalidateLiveness() }
+        stateLock.lock()
+        let alreadyActive = generationGate.activeID != nil
+        stateLock.unlock()
+        if !alreadyActive { invalidateLiveness() }
 
-        queue.async {
+        sessionQueue.async {
             self.configureIfNeeded()
-            if self.configured, !self.session.isRunning {
-                self.session.startRunning()
+            if self.configured {
+                let wasRunning = self.session.isRunning
+                if !wasRunning { self.session.startRunning() }
                 self.stateLock.lock()
-                self.streamingSince = Uptime.now
+                if !wasRunning { self.streamingSince = Uptime.now }
+                if let id = self.captureGeneration?.id {
+                    self.generationGate.activate(id)
+                }
                 self.stateLock.unlock()
             }
             // Fires even when configuration failed, so a caller waiting to show
@@ -207,8 +297,28 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         }
     }
 
+    /// Stops the session **and drops its configuration**, so the next `start()`
+    /// rebuilds inputs and outputs from scratch.
+    ///
+    /// The recovery path needs this rather than `stop()`. `configured` latches
+    /// true and was only ever reset by the runtime-error notification, so a
+    /// session that wedges *without* posting an error — which is a real state,
+    /// the same one that reads as running while delivering nothing — was retried
+    /// forever against the identical broken graph. The retry ladder could recover
+    /// "the device was briefly busy" and nothing else.
+    func teardown() {
+        // Synchronous invalidation makes the coordinator stop trusting the old
+        // stream immediately. The destructive work uses the independent session
+        // queue, so even a permanently hung analysis cannot block recovery.
+        invalidateLiveness()
+        sessionQueue.async {
+            if self.session.isRunning { self.session.stopRunning() }
+            self.teardownConfiguration()
+        }
+    }
+
     func stop() {
-        queue.async {
+        sessionQueue.async {
             guard self.session.isRunning else { return }
             self.session.stopRunning()
             // Liveness must not survive a stop: a stopped session has proven
@@ -223,6 +333,7 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         firstFrame = nil
         lastFrame = nil
         streamingSince = nil
+        generationGate.invalidate()
         stateLock.unlock()
     }
 
@@ -283,13 +394,17 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             session.sessionPreset = .vga640x480
         }
         session.addInput(input)
-        output.alwaysDiscardsLateVideoFrames = true
+        let generation = CaptureGeneration(id: nextGenerationID, owner: self)
+        nextGenerationID += 1
         // No videoSettings: keep the camera's native YUV format — skipping the
         // BGRA conversion saves CPU and memory; Vision and CoreImage take YUV.
-        output.setSampleBufferDelegate(self, queue: queue)
-        if session.canAddOutput(output) {
-            session.addOutput(output)
+        guard session.canAddOutput(generation.output) else {
+            session.removeInput(input)
+            session.commitConfiguration()
+            Log.camera.error("cannot add the video data output")
+            return
         }
+        session.addOutput(generation.output)
         session.commitConfiguration()
 
         // Ask the sensor for the slowest rate it admits to supporting. This is a
@@ -313,42 +428,58 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                 // Non-fatal: analysis throttling still bounds the real work.
             }
         }
-
+        captureGeneration = generation
         configured = true
     }
 
-    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+    // MARK: - Frame analysis
 
-    func captureOutput(
-        _ output: AVCaptureOutput,
-        didOutput sampleBuffer: CMSampleBuffer,
-        from connection: AVCaptureConnection
-    ) {
+    func generationIsActive(_ id: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return generationGate.accepts(id)
+    }
+
+    private func captureOutput(_ sampleBuffer: CMSampleBuffer, from generation: CaptureGeneration) {
         let now = Uptime.now
         // Counted before the analysis throttle: delivery alone proves the
         // capture pipeline is alive, whether or not this frame gets analyzed.
         stateLock.lock()
+        guard generationGate.accepts(generation.id) else {
+            stateLock.unlock()
+            return
+        }
         if firstFrame == nil { firstFrame = now }
         lastFrame = now
         let interval = self.interval
         let enrollmentMode = self.enrollmentMode
         stateLock.unlock()
 
-        guard now - lastAnalysis >= interval else { return }
-        lastAnalysis = now
+        guard now - generation.lastAnalysis >= interval else { return }
+        generation.lastAnalysis = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
-        guard (try? handler.perform([faceRequest])) != nil else { return }
-        let faces = faceRequest.results ?? []
+        guard (try? handler.perform([generation.faceRequest])) != nil else { return }
+        let faces = generation.faceRequest.results ?? []
+        var qualityFaces: [VNFaceObservation] = []
+        if enrollmentMode {
+            // Keep the revision-pinned rectangle request as the source of pose
+            // and embedding geometry. Capture quality is a second observation
+            // set and is correlated by overlap below; substituting it directly
+            // can lose yaw/pitch or attach another face's score.
+            if (try? handler.perform([generation.faceQualityRequest])) != nil {
+                qualityFaces = generation.faceQualityRequest.results ?? []
+            }
+        }
 
         // The body pass is only a fallback presence signal for when no face is
         // visible at all (head fully turned away) — skip it when a face is in
         // frame, where it could never change the outcome.
         var bodyCount = 0
-        if faces.isEmpty, (try? handler.perform([humanRequest])) != nil {
-            bodyCount = humanRequest.results?.count ?? 0
+        if faces.isEmpty, (try? handler.perform([generation.humanRequest])) != nil {
+            bodyCount = generation.humanRequest.results?.count ?? 0
         }
 
         // -1 distinguishes "no face was scored at all" from a genuine 0.0 match.
@@ -379,11 +510,24 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                 $0.boundingBox.width * $0.boundingBox.height <
                 $1.boundingBox.width * $1.boundingBox.height
             }
-            if let largest, let embedding = recognizer.embedding(for: largest, in: pixelBuffer) {
+            if let largest, let embedding = recognizer.embedding(
+                for: largest,
+                in: pixelBuffer,
+                context: generation.inferenceContext
+            ) {
+                let captureQuality = FaceCaptureQualityMatcher.quality(
+                    for: largest.boundingBox,
+                    candidates: qualityFaces.compactMap { qualityFace in
+                        qualityFace.faceCaptureQuality.map {
+                            (box: qualityFace.boundingBox, quality: $0)
+                        }
+                    }
+                )
                 result.enrollmentSample = EnrollmentSample(
                     embedding: embedding,
                     yaw: largest.yaw?.floatValue ?? 0,
-                    pitch: largest.pitch?.floatValue ?? 0
+                    pitch: largest.pitch?.floatValue ?? 0,
+                    captureQuality: captureQuality
                 )
             }
         } else if !faces.isEmpty {
@@ -399,7 +543,11 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                     $1.boundingBox.width * $1.boundingBox.height
                 }
                 for face in byArea.prefix(maxFacesToMatch) {
-                    guard let embedding = recognizer.embedding(for: face, in: pixelBuffer),
+                    guard let embedding = recognizer.embedding(
+                        for: face,
+                        in: pixelBuffer,
+                        context: generation.inferenceContext
+                    ),
                           let similarity = recognizer.similarityToOwner(embedding)
                     else { continue }
                     if similarity > bestSimilarity {
@@ -428,6 +576,11 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             }
         }
 
+        // Teardown invalidates the generation before session control runs. A
+        // hung old inference that eventually returns must not log or answer into
+        // the rebuilt session.
+        guard generationIsActive(generation.id) else { return }
+
         // Info level, not debug. Debug is never written to the persistent store,
         // so it can only be watched live — which is useless for a symptom the
         // user reports an hour later, and it wasted a capture attempt proving
@@ -446,6 +599,6 @@ final class FaceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             )
         }
 
-        onResult?(result)
+        onResult?(generation.id, result)
     }
 }

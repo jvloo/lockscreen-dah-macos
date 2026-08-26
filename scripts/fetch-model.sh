@@ -4,6 +4,8 @@
 #
 # The converted model takes a 112x112 RGB face crop and returns a 512-d identity
 # embedding. Conversion runs in a throwaway venv; nothing Python is needed at runtime.
+# InsightFace's pretrained weights are non-commercial-research assets, not MIT:
+# downloading/converting them does not grant redistribution or commercial-use rights.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,6 +23,7 @@ mkdir -p "$WORK" Resources
 # Pinned SHA-256 of the release asset — a swapped or MITM'd download (which
 # would otherwise be converted and shipped as the recognition model) fails here.
 BUFFALO_SC_SHA256="57d31b56b6ffa911c8a73cfc1707c73cab76efe7f13b675a05223bf42de47c72"
+W600K_MBF_SHA256="9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f"
 ONNX="$WORK/w600k_mbf.onnx"
 if [ ! -f "$ONNX" ]; then
   echo "Downloading buffalo_sc.zip (InsightFace)..."
@@ -38,6 +41,11 @@ if [ ! -f "$ONNX" ]; then
   [ -n "$FOUND" ] || { echo "w600k_mbf.onnx not found in archive"; exit 1; }
   [ "$FOUND" != "$ONNX" ] && cp "$FOUND" "$ONNX"
 fi
+ONNX_ACTUAL="$(shasum -a 256 "$ONNX" | cut -d' ' -f1)"
+[ "$ONNX_ACTUAL" = "$W600K_MBF_SHA256" ] || {
+  echo "checksum mismatch for $ONNX" >&2
+  exit 1
+}
 
 # 2. Convert ONNX -> TorchScript -> Core ML mlprogram
 PY="$(command -v python3.12 || command -v python3.11 || command -v python3.10 || command -v python3)"
@@ -47,15 +55,48 @@ if [ ! -d "$WORK/venv" ]; then
 fi
 # shellcheck disable=SC1091
 source "$WORK/venv/bin/activate"
-pip install --quiet --upgrade pip
-pip install --quiet torch onnx onnx2torch coremltools numpy
+# Exact-version converter environment, captured from the locally healthy Python
+# 3.9 setup that produced the current model and passes `pip check`. Transitives
+# are explicit because they can otherwise change conversion output or break
+# resolution over time.
+python -m pip install --quiet --upgrade "pip==26.0.1"
+python -m pip install --quiet \
+  "attrs==26.1.0" \
+  "cattrs==25.3.0" \
+  "coremltools==9.0" \
+  "exceptiongroup==1.3.1" \
+  "filelock==3.19.1" \
+  "fsspec==2025.10.0" \
+  "Jinja2==3.1.6" \
+  "MarkupSafe==3.0.3" \
+  "ml_dtypes==0.5.4" \
+  "mpmath==1.3.0" \
+  "networkx==3.2.1" \
+  "numpy==2.0.2" \
+  "onnx==1.19.1" \
+  "onnx2torch==1.5.15" \
+  "packaging==26.2" \
+  "Pillow==11.3.0" \
+  "protobuf==6.33.6" \
+  "pyaml==26.7.0" \
+  "PyYAML==6.0.3" \
+  "sympy==1.14.0" \
+  "torch==2.8.0" \
+  "torchvision==0.23.0" \
+  "tqdm==4.68.4" \
+  "typing_extensions==4.16.0"
+python -m pip check
 
-python - <<'PYEOF'
+python - "$WORK" <<'PYEOF'
+import sys
+from pathlib import Path
+
 import onnx, torch, numpy as np
 import coremltools as ct
 from onnx2torch import convert
 
-onnx_model = onnx.load(".model-work/w600k_mbf.onnx")
+work = Path(sys.argv[1])
+onnx_model = onnx.load(str(work / "w600k_mbf.onnx"))
 torch_model = convert(onnx_model)
 torch_model.eval()
 
@@ -89,8 +130,8 @@ cos = float(np.dot(t_out, c_out) / (np.linalg.norm(t_out) * np.linalg.norm(c_out
 print(f"torch-vs-coreml cosine agreement: {cos:.5f}")
 assert cos > 0.999, "conversion mismatch"
 
-mlmodel.save(".model-work/FaceEmbedding.mlpackage")
-print("saved .model-work/FaceEmbedding.mlpackage")
+mlmodel.save(str(work / "FaceEmbedding.mlpackage"))
+print("saved FaceEmbedding.mlpackage")
 PYEOF
 
 # 3. Compile to .mlmodelc for bundling

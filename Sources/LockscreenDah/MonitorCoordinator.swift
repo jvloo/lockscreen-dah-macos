@@ -37,8 +37,10 @@ final class MonitorCoordinator {
     let recognizer = FaceRecognizer()
     private lazy var monitor: FaceMonitor = {
         let monitor = FaceMonitor(recognizer: recognizer)
-        monitor.onResult = { [weak self] result in
-            DispatchQueue.main.async { self?.handleDetection(result) }
+        monitor.onResult = { [weak self] generationID, result in
+            DispatchQueue.main.async {
+                self?.handleDetection(result, from: generationID)
+            }
         }
         return monitor
     }()
@@ -64,7 +66,7 @@ final class MonitorCoordinator {
     private let supervisionInterval: TimeInterval = 1
     /// Precise one-shot timer for firing the countdown exactly at the grace
     /// deadline — see `rescheduleGraceTimer()`. The 1 Hz `tickTimer` above
-    /// only adjusts sampling rate and camera-rest bookkeeping now; it no
+    /// only adjusts the adaptive sampling rate now; it no
     /// longer decides when to alert, since polling once a second can report
     /// an expired grace period up to ~1 s late.
     private lazy var graceTimer = DeadlineTimer { [weak self] in self?.handleGraceExpired() }
@@ -104,9 +106,28 @@ final class MonitorCoordinator {
     /// When the current capture session first produced an analysis result, as
     /// opposed to a frame. Nil until then; see `graceAnchor`.
     private var firstResultAt: TimeInterval?
-    /// How long recognition may take to produce its first verdict before
-    /// absence becomes provable anyway.
-    private let analysisWarmupAllowance: TimeInterval = 3
+    /// The most recent analysis result. Distinct from `firstResultAt`: that one
+    /// answers "has recognition warmed up yet", this one answers "is anything
+    /// still looking at the frames". Frames arriving proves only that the camera
+    /// is alive.
+    private var lastResultAt: TimeInterval?
+    /// How long analysis may go quiet before it counts as stalled. Derived from
+    /// the current cadence rather than fixed, because results are throttled by
+    /// design — at the idle interval of 2.5 s a fixed 3 s bar would call a
+    /// healthy pipeline dead. Four intervals is the same margin the cadence
+    /// itself is built on.
+    private var analysisStaleAfter: TimeInterval {
+        max(cameraStaleAfter, 4 * monitor.analysisInterval)
+    }
+    /// How long the whole startup may take to produce its first verdict. The
+    /// worst observed result under contention was 19.85 s after start, so 25 s
+    /// leaves measured headroom without allowing a frames-but-no-thinking
+    /// pipeline to remain blind forever.
+    ///
+    /// Shared by liveness and `graceAnchor`: before this expires, no-result is
+    /// warm-up and absence cannot be proved; after it expires, the exact same
+    /// condition is an analysis stall and routes to recovery rather than a lock.
+    private let firstAnalysisAllowance: TimeInterval = 25
     private var cameraFailures = 0
     /// Backoff before each retry, holding at the last value. Retrying never
     /// stops: the reason to keep trying — that the screen is unprotected — does
@@ -291,6 +312,7 @@ final class MonitorCoordinator {
         monitor.analysisInterval = idleAnalysisInterval
         cameraStartedAt = Uptime.now
         firstResultAt = nil
+        lastResultAt = nil
         Log.camera.notice("starting capture")
         monitor.start()
         startTick(interval: 1)
@@ -298,9 +320,9 @@ final class MonitorCoordinator {
         rescheduleGraceTimer()
     }
 
-    /// True when the capture pipeline has stopped delivering. Measured from the
-    /// last frame, or from the start when none has arrived — one rule covering
-    /// both "never came up" and "died later".
+    /// True when capture or analysis has stopped delivering. Startup, frame gaps
+    /// and result gaps have separate bars because they are different failure
+    /// signals with very different healthy timing.
     /// Delegates to `CameraLiveness`, which is pure and therefore testable —
     /// this rule previously lived here, where no test could reach it, and shipped
     /// a restart loop. One helper because two callers ask the question (the
@@ -312,8 +334,11 @@ final class MonitorCoordinator {
             requestedAt: cameraStartedAt,
             streamingSince: monitor.streamingSinceAt,
             lastFrameAt: monitor.lastFrameAt,
+            lastResultAt: lastResultAt,
             staleAfter: cameraStaleAfter,
-            startupAllowance: cameraStartupAllowance
+            startupAllowance: cameraStartupAllowance,
+            firstAnalysisAllowance: firstAnalysisAllowance,
+            analysisStaleAfter: analysisStaleAfter
         )
     }
 
@@ -336,15 +361,30 @@ final class MonitorCoordinator {
     /// gathered while we could still see. So that case locks, once; every other
     /// case holds the screen and retries.
     private func handleCameraStopped(now: TimeInterval) {
-        let absenceWasAlreadyProven = now - graceAnchor >= Settings.gracePeriod
-        Log.camera.error("stopped delivering; absenceAlreadyProven=\(absenceWasAlreadyProven, privacy: .public)")
+        let liveness = cameraLiveness(now: now)
+        // `gap` begins where sight stopped: the last frame, the last analysis
+        // result, or the original request when no result ever arrived. Only a
+        // grace deadline that had already passed by that instant is evidence of
+        // absence gathered while sight still worked. Comparing against `now`
+        // would charge the blind interval as absence and lock during recovery.
+        let absenceWasAlreadyProven = liveness.absenceWasProven(
+            now: now,
+            graceAnchor: graceAnchor,
+            gracePeriod: Settings.gracePeriod
+        )
+        Log.camera.error("pipeline stalled (\(String(describing: liveness.stall), privacy: .public)); absenceAlreadyProven=\(absenceWasAlreadyProven, privacy: .public)")
 
         overlay.dismiss()
         cancelEscapeAuth()
         stopTick()
         stopGraceTimer()
         stopLockTimer()
-        monitor.stop()
+        // teardown(), not stop(): the retry that follows must rebuild the capture
+        // graph. `configureIfNeeded` short-circuits while `configured` is true,
+        // so a plain stop/start only ever re-issues startRunning() against the
+        // same inputs and outputs — which recovers a briefly-busy device and
+        // nothing else.
+        monitor.teardown()
 
         if absenceWasAlreadyProven {
             // We saw you leave before we went blind. Locking is warranted, and
@@ -525,17 +565,28 @@ final class MonitorCoordinator {
 
     // MARK: - Detection handling
 
-    private func handleDetection(_ result: DetectionResult) {
+    private func handleDetection(_ result: DetectionResult, from generationID: Int) {
+        // The generation checked this immediately before emitting, but delivery
+        // crosses to the main queue. Teardown can invalidate it in that gap; a
+        // second check here makes the refusal atomic with coordinator handling.
+        guard monitor.generationIsActive(generationID) else { return }
         // Frames are arriving; the camera is demonstrably fine — but only if this
         // result belongs to the *current* session. Results from an already torn
-        // down session still arrive (measured 5.6 s after teardown), and letting
-        // one clear the counter meant the backoff never escalated: the log showed
-        // "retry 1 in 30s" seven times in a row while the ladder [30, 60, 300]
-        // sat unused, hammering a device that was already struggling.
-        if result.capturedAt >= cameraStartedAt {
-            cameraFailures = 0
-            cameraFailureAnnounced = false
-        }
+        // down session still arrive — measured 5.6 s after teardown — and one is
+        // evidence about a moment that has passed, not about now.
+        //
+        // Dropped outright rather than filtered per-consumer, because every
+        // consumer is wrong to trust it: it cleared the failure counter so the
+        // retry ladder never escalated ("retry 1 in 30s" seven times in a row);
+        // `presence.observe` stamps `lastOwnerSeen` with the frame's own capture
+        // instant, so a stale match moved the presence clock *backwards* and
+        // could put the grace deadline in the past; and in `.alerting` a stale
+        // match would cancel a countdown that is still legitimately running.
+        guard result.capturedAt >= cameraStartedAt else { return }
+
+        cameraFailures = 0
+        cameraFailureAnnounced = false
+        lastResultAt = Uptime.now
         if firstResultAt == nil {
             firstResultAt = Uptime.now
             Log.camera.notice("first analysis result \(self.firstResultAt! - self.cameraStartedAt, format: .fixed(precision: 2), privacy: .public)s after start")
@@ -644,7 +695,7 @@ final class MonitorCoordinator {
         if decision != .doNothing {
             // The conditions, not just the outcome: which fact drove it is the
             // whole question when a camera is unexpectedly off.
-            Log.state.notice("supervisor decided \(String(describing: decision), privacy: .public) in \(self.state.logName, privacy: .public): sessionLocked=\(ScreenLocker.sessionIsLocked, privacy: .public) displayAsleep=\(ScreenLocker.displayIsAsleep, privacy: .public) sinceFrame=\(liveness.gap, format: .fixed(precision: 1), privacy: .public)s bar=\(liveness.bar, format: .fixed(precision: 0), privacy: .public)s streaming=\(self.monitor.streamingSinceAt != nil, privacy: .public)")
+            Log.state.notice("supervisor decided \(String(describing: decision), privacy: .public) in \(self.state.logName, privacy: .public): sessionLocked=\(ScreenLocker.sessionIsLocked, privacy: .public) displayAsleep=\(ScreenLocker.displayIsAsleep, privacy: .public) gap=\(liveness.gap, format: .fixed(precision: 1), privacy: .public)s bar=\(liveness.bar, format: .fixed(precision: 0), privacy: .public)s stall=\(String(describing: liveness.stall), privacy: .public) streaming=\(self.monitor.streamingSinceAt != nil, privacy: .public)")
         }
         switch decision {
         case .doNothing: break
@@ -673,17 +724,14 @@ final class MonitorCoordinator {
     /// Schedules (or reschedules) the precise one-shot timer that fires the
     /// countdown exactly `gracePeriod` seconds after presence was last
     /// confirmed. Call this every time `presence`'s `lastOwnerSeen` might
-    /// have moved forward (a fresh observation, Esc-cancel, camera-rest
-    /// touch) — rescheduling to the same deadline when nothing changed is
+    /// have moved forward (a fresh observation or Esc-cancel) — rescheduling
+    /// to the same deadline when nothing changed is
     /// harmless. No tolerance is set: unlike `tickTimer`, this one exists
     /// specifically to be on time.
-    /// The instant the grace clock counts from: the later of "presence was last
-    /// confirmed" and "this capture session delivered its first frame". The
-    /// second term matters because `presence.reset()` stamps `beginWatching`,
-    /// an instant when the camera provably was not looking yet — session
-    /// spin-up to first frame is ~1 s, which a short grace period expires
-    /// entirely inside. Without it, every unlock at grace 1 s blacked out a
-    /// seated user before the camera had produced a usable frame.
+    /// The instant the grace clock counts from: the later of confirmed presence
+    /// and analysis readiness. `presence.reset()` stamps `beginWatching`, when
+    /// the pipeline is provably blind; readiness advances until the first result
+    /// or the bounded first-analysis allowance.
     private var graceAnchor: TimeInterval {
         // A frame nobody has analysed yet is as blind as no frame at all. The
         // first Core ML inference carries model load and ANE warm-up — measured
@@ -692,12 +740,13 @@ final class MonitorCoordinator {
         // expire before recognition could possibly have answered, blacking out a
         // seated user on every start. Anchor to the first *verdict*.
         //
-        // Bounded, so a pipeline delivering frames but never results cannot hold
-        // the deadline off indefinitely: past the allowance the anchor stops
-        // sliding and absence becomes provable again. A spurious countdown is a
-        // nuisance; a monitor that can never lock is a broken promise.
+        // Bounded by the same allowance as analysis liveness. Until then the
+        // pipeline is warming up and a no-result frame stream cannot prove
+        // absence. Once it expires, liveness calls it an analysis stall and the
+        // recovery path wins before a grace deadline can turn blindness into a
+        // lock.
         let readiness = firstResultAt
-            ?? min(Uptime.now, (monitor.firstFrameAt ?? cameraStartedAt) + analysisWarmupAllowance)
+            ?? min(Uptime.now, cameraStartedAt + firstAnalysisAllowance)
         return max(presence.lastOwnerSeen, readiness)
     }
 
@@ -780,12 +829,9 @@ final class MonitorCoordinator {
         rescheduleGraceTimer()
     }
 
-    /// Ends camera rest and restarts the capture session. Waking is an identity
-    /// gate — the camera was blind, so the seat may have changed hands. Break
-    /// the chain: face/body may not maintain presence again until one fresh
-    /// positive match lands. The grace clock restarts from the wake (spin-up
-    /// never eats into it) and sampling runs fast, so a facing owner re-matches
-    /// in ~1 s; no match within the grace period means a countdown.
+    /// Maintains the adaptive analysis cadence while watching and redraws an
+    /// active countdown. Session recovery is owned by `superviseInvariants`;
+    /// this timer never stops or restarts capture.
     private func handleTick() {
         switch state {
         case .watching:

@@ -166,8 +166,9 @@ It never lands late. Closing the gap further means sampling faster, which is
 the CPU tradeoff above. (An earlier version of this table assumed the sensor
 ran at 3 fps, which the code asks for but this hardware does not honour —
 measured delivery is far higher, so the quantisation is finer than previously
-documented.) The clock also doesn't start until the camera has
-delivered its first frame, so opening a session never eats into your delay.
+documented.) The clock does not start while capture and first analysis are
+warming up. If that produces no verdict within its bounded allowance, the app
+enters camera recovery instead of treating the blind interval as absence.
 
 ### Countdown Duration (3/5/10 s or Never Countdown, default 3)
 
@@ -245,7 +246,7 @@ or "no one ever does".
 ```
 AVCaptureSession (640x480 YUV; the sensor is asked for its slowest rate,
   which some cameras ignore — the analysis throttle is what bounds cost)
-  → adaptive throttle (idle scales with the countdown delay: one analysis per
+  → adaptive throttle (normal cadence scales with the countdown delay: one analysis per
     delay/4 s, clamped 0.25–2.5 s; every frame while confirming absence / counting down)
   → Vision face detection (any head angle); upper-body detection only on face-less frames
   → [face found] align → Core ML MobileFaceNet embedding (ANE) → cosine match vs enrolled profile
@@ -268,10 +269,14 @@ AVCaptureSession (640x480 YUV; the sensor is asked for its slowest rate,
   while Vision measures the unmirrored buffer, so the stages require two
   *opposite* turns and let the user's first turn define the pair. Head tilt is
   judged against the resting pitch captured in the first stage, since a laptop
-  camera reads ~0.2 rad on someone sitting normally. Nothing is saved until you confirm, and your
-  existing profile is never touched until then. Enrolling/re-enrolling
+  camera reads ~0.2 rad on someone sitting normally. Each pose produces its own
+  template; the lowest Vision capture-quality frame within that pose is omitted
+  when the score is available. Capture quality ranks nearby frames only — it is
+  not liveness detection. Nothing is saved until you confirm, and your existing
+  profile is never touched until then. Enrolling/re-enrolling
   requires Touch ID or your macOS password, so a passerby can't swap it.
   Profile lives at `~/Library/Application Support/LockscreenDah/profile.json`.
+  Existing profiles keep their original templates until they are re-enrolled.
 - **Three answers, not two**: a frontal face is scored as *confidently you*
   (refreshes identity), *confidently not you* (breaks the chain after three
   consecutive frames), or *ambiguous* — and ambiguity sustains presence exactly
@@ -295,12 +300,6 @@ AVCaptureSession (640x480 YUV; the sensor is asked for its slowest rate,
   Security).  The overlay is
   deliberately discreet, a passerby sees a sleeping display, not a "this Mac
   is unlocked" billboard; you get a soft chime as the cue.
-- **Camera idle while typing**: sustained keyboard/mouse use puts the
-  capture session to sleep entirely (LED off, ~0% CPU); it wakes once
-  typing pauses. Waking is an identity gate: the camera was blind, so the
-  chain must be re-established by a fresh match before face or body alone
-  can maintain it again. Never idles before a positive match, during
-  countdown/enrollment, or when the grace period is under 3 s.
 - **Deadlines are monotonic**: the countdown and the lock are armed off a
   monotonic clock, so a system clock change can't fire either early. Active
   Hours & Days deliberately stays on wall-clock time — if the date changes, the
@@ -321,7 +320,7 @@ AVCaptureSession (640x480 YUV; the sensor is asked for its slowest rate,
 - **Low footprint**: sensor frame rate capped, analysis throttled, the
   embedding model only runs when a face is detected, and the camera fully
   stops while locked/asleep/paused. Measured while watching: ~150 MB RSS,
-  ~8–9% of one core. Idle / paused / locked: ~16 MB, 0% CPU.
+  ~8–9% of one core. Paused / locked: ~16 MB, 0% CPU.
 
 ## Security
 
@@ -336,23 +335,24 @@ What the app is and isn't, so the guarantees are clear:
 - **Identity is established, then maintained**, without a time cap, by the
   seat-continuity chain described in [How it works](#how-it-works): this is
   what lets you work turned toward a second screen without nagging.
-- **Two identity gates re-assert "is it really you"**: the countdown (a
-  stranger's face alone can't hold the screen open) and waking from camera
-  idle (body alone won't restore presence; only a fresh match will).
-- **Fail-closed.** Camera contention, a stuck pipeline, or a lost face all
-  let absence grow into a lock rather than a false sense of safety.
+- **The countdown re-asserts "is it really you"**: a stranger's face alone
+  can't hold the screen open once absence has triggered it.
+- **Blindness is explicit and recoverable.** If camera delivery or analysis
+  stalls, the app stops claiming protection and retries from a rebuilt capture
+  session. It locks only when absence was already proven before sight was lost;
+  time spent blind is not evidence of absence.
 - **All processing is on-device**. See [Audit findings](#audit-findings)
   for the traced, frame-by-frame claim.
 
 ### Risks
 
-Worst-case time until the screen locks, with defaults (grace 3 s,
-countdown 3 s, wake 2 s):
+Worst-case time until the screen locks, with defaults (grace 1 s,
+countdown 3 s):
 
 | Scenario | Max exposure |
 |---|---|
-| You leave; empty seat | ~6 s (grace + countdown) |
-| Stranger takes the seat and faces the screen | ~6 s, same as an empty seat — a face already confirmed as not you doesn't buy it any extra time |
+| You leave; empty seat | ~4 s (grace + countdown) |
+| Stranger takes the seat and faces the screen | ~4 s, same as an empty seat — a face already confirmed as not you doesn't buy it any extra time |
 | Stranger in the seat who **never faces the screen** (head down, turned away) while the camera watches | No time cap: body detection has no identity check (only the face path does), so a torso in frame maintains presence indefinitely. **Accepted deliberately** — an intruder has to look at the screen to do anything with the machine, and the moment they do the frontal check breaks the chain within ~3 frames. Capping it would instead lock out an owner turned toward a second monitor. |
 
 Structural risks, independent of settings:
@@ -381,12 +381,11 @@ Structural risks, independent of settings:
   same private API as Ctrl-Cmd-Q) could disappear in a macOS update;
   `CGSession -suspend` is the fallback, and either way the post-lock
   verification above catches a silent failure rather than hiding it.
-- **Camera contention**: another app owning the camera can stall detection
-  in an *already-running* session; absence then grows until the countdown
-  fires and locks (fail-closed, but expect a surprise blackout). Contention
-  that prevents the session from starting in the first place is a separate,
-  now-handled case — see [How it works](#how-it-works)'s "Camera start is
-  verified too".
+- **Camera / analysis failure**: the app reports **Camera unavailable**, stops
+  claiming protection, and retries with a rebuilt capture session. It holds the
+  screen open unless absence had already passed its deadline before sight was
+  lost; that already-proven case locks once. While recovery is pending, the menu
+  bar's struck-through camera is the warning that no protection is active.
 - Physical access to your unlocked Mac is, as always, game over for any
   software measure.
 
@@ -459,6 +458,11 @@ and [commercial licensing page](https://www.insightface.ai/solutions/face-recogn
 Commercial use of Lockscreen Dah? (distinct from personal/non-commercial use)
 may require separately licensing the model from InsightFace; this project's
 own [MIT License](LICENSE) covers only its own Swift source.
+
+For local model-quality and latency comparisons, including a user-provided R50
+Core ML model, see [Recognition model evaluation](docs/TESTING.md#recognition-model-evaluation).
+The production app remains pinned to the bundled MobileFaceNet resource; the
+evaluator never changes or saves the active model or face profile.
 
 ## Contributing
 

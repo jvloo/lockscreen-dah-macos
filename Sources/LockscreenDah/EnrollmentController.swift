@@ -280,7 +280,9 @@ final class EnrollmentController {
                 // All poses captured — build the candidate and verify
                 // automatically; nothing is saved until the user hits Save.
                 do {
-                    candidateProfile = try recognizer.makeCandidateProfile(samples: samples)
+                    candidateProfile = try recognizer.makeCandidateProfile(
+                        poseSamples: completedStageSamples
+                    )
                     beginVerification()
                 } catch {
                     showFailure(error.localizedDescription)

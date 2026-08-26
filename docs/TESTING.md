@@ -193,6 +193,65 @@ available from an RGB webcam without depth. A photo of the owner can cancel a
 countdown. This is presence tooling, not authentication — unlocking still needs
 your password or Touch ID.
 
+## Recognition model evaluation
+
+The opt-in evaluator compares the current MobileFaceNet model with an optional
+user-provided R50 compiled Core ML model. It runs through the executable's CLI
+path before AppKit starts, so it does not launch or install the menu-bar app. It
+uses the production face alignment, crop fallback, normalization and inference
+code, retains images/embeddings only in memory, and writes aggregate JSON to
+stdout. It never commits a profile or copies the dataset.
+
+Create a local JSON manifest. Image paths are relative to the manifest unless
+absolute. Use the same four enrollment poses as the app, at least four images per
+pose, and both owner and non-owner probes:
+
+```json
+{
+  "threshold": 0.45,
+  "modelThresholds": { "r50": 0.50 },
+  "enrollment": [
+    { "name": "straight", "images": ["owner/straight-1.jpg", "owner/straight-2.jpg", "owner/straight-3.jpg", "owner/straight-4.jpg"] },
+    { "name": "left", "images": ["owner/left-1.jpg", "owner/left-2.jpg", "owner/left-3.jpg", "owner/left-4.jpg"] },
+    { "name": "right", "images": ["owner/right-1.jpg", "owner/right-2.jpg", "owner/right-3.jpg", "owner/right-4.jpg"] },
+    { "name": "down", "images": ["owner/down-1.jpg", "owner/down-2.jpg", "owner/down-3.jpg", "owner/down-4.jpg"] }
+  ],
+  "probes": [
+    { "image": "owner/later.jpg", "subject": "owner", "expectedOwner": true },
+    { "image": "others/person-a.jpg", "subject": "other-a", "expectedOwner": false }
+  ]
+}
+```
+
+Run MBF alone, or pass a second, already-compiled model for the A/B comparison:
+
+```sh
+scripts/evaluate-model.sh /absolute/path/dataset.json
+scripts/evaluate-model.sh /absolute/path/dataset.json /absolute/path/R50.mlmodelc
+```
+
+Set `MBF_MODEL_PATH` only when testing a non-default compiled MBF artifact. The
+R50 must accept the same 112×112 image input and produce a finite 512-value
+embedding. Models are evaluated with independent thresholds: a threshold tuned
+for MBF is not assumed to transfer to R50. The evaluator decodes and detects
+each frame once, then alternates which model embeds it first so warm-cache and
+thermal order do not consistently favour one model. Cold-load numbers are still
+order-sensitive; reverse the two direct `--model` arguments for a cold-start
+cross-check when that metric is decisive.
+
+The JSON report contains model size, validation/cold/warm latency percentiles,
+owner and non-owner similarity distributions, FAR/FRR outcomes and their exact
+probe and opaque-subject denominators, plus model/manifest fingerprints and the
+hardware/OS context. Probe end-to-end latency follows the production path
+(revision-3 rectangle detection, alignment and embedding); capture quality is
+enrollment-only. The report contains no image paths, per-image scores, embeddings
+or output-file option. Keep the dataset local and do not commit biometric material.
+
+This harness does not download, convert, redistribute, or license a model.
+InsightFace's pretrained weights, including MBF/R50 pack weights, remain subject
+to InsightFace's non-commercial-research terms unless separately licensed; the
+repository's MIT license covers the app's own source only.
+
 ## Manual checklist
 
 Run after any change to `MonitorCoordinator`, `FaceMonitor`, `PresenceTracker`
